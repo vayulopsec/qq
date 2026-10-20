@@ -4,23 +4,17 @@ project(esp_drv CXX)
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
-# ---------------------------------------------------------------------------
 # Убираем дефолтный /EHsc, который CMake добавляет для MSVC.
-# Без этого получим warning D9025 при использовании /EHs-c-.
-# ---------------------------------------------------------------------------
 if(MSVC)
     string(REGEX REPLACE "/EHsc" "" CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS}")
 endif()
 
-# ---------------------------------------------------------------------------
 # Ищем WDK
-# ---------------------------------------------------------------------------
 set(WDK_ROOT "$ENV{ProgramFiles\(x86\)}/Windows Kits/10" CACHE PATH "WDK root")
 if (NOT EXISTS "${WDK_ROOT}/Include")
     message(FATAL_ERROR "WDK not found at ${WDK_ROOT}")
 endif()
 
-# Берём самую новую версию WDK (natural sort, по убыванию)
 file(GLOB WDK_VERSIONS LIST_DIRECTORIES true "${WDK_ROOT}/Include/10.*")
 if (NOT WDK_VERSIONS)
     message(FATAL_ERROR "No WDK versions found in ${WDK_ROOT}/Include")
@@ -33,9 +27,6 @@ message(STATUS "Using WDK ${WDK_VERSION}")
 set(WDK_INC "${WDK_ROOT}/Include/${WDK_VERSION}")
 set(WDK_LIB "${WDK_ROOT}/Lib/${WDK_VERSION}/km/x64")
 
-# ---------------------------------------------------------------------------
-# Цель
-# ---------------------------------------------------------------------------
 add_executable(esp_drv esp_drv.cpp)
 
 target_include_directories(esp_drv PRIVATE
@@ -51,20 +42,26 @@ target_compile_definitions(esp_drv PRIVATE
     WIN32_LEAN_AND_MEAN
     NOMINMAX
     POOL_NX_OPTIN=1
-    NTDDI_VERSION=0x0A00000C   # Win10 22H2+
+    NTDDI_VERSION=0x0A00000C
     _WIN32_WINNT=0x0A00
     _AMD64_
+    _HAS_EXCEPTIONS=0
+    _HAS_ITERATOR_DEBUGGING=0
+    _ITERATOR_DEBUG_LEVEL=0
+    _CRT_SECURE_NO_WARNINGS
 )
 
 target_compile_options(esp_drv PRIVATE
-    /kernel           # kernel mode
-    /GS-              # no stack cookies
-    /GR-              # no RTTI
-    /EHs-c-           # no C++ exceptions (synchronous)
-    /EHc-             # no C++ exceptions (extern "C" defaults)
-    /Zl               # no default lib (manual map friendly)
+    /kernel
+    /GS-
+    /GR-
+    /EHs-c-
+    /EHc-
+    /Zl
     /O2
     /W3
+    /WX-
+    /wd4996
 )
 
 target_link_options(esp_drv PRIVATE
@@ -82,9 +79,9 @@ target_link_libraries(esp_drv PRIVATE
     "${WDK_LIB}/ntstrsafe.lib"
 )
 
-# Выход — esp_drv.sys вместо esp_drv.exe
 set_target_properties(esp_drv PROPERTIES
     SUFFIX ".sys"
     PREFIX ""
     OUTPUT_NAME "esp_drv"
+    LINK_FLAGS "/MANIFEST:NO"     # <<< ключевая правка: убирает /MANIFEST:EMBED
 )
