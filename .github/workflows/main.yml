@@ -15,52 +15,45 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Download & Install WDK (10.0.26100)
-        shell: pwsh
-        run: |
-          Write-Host "Downloading WDK 10.0.26100.1 installer..."
-          $wdkUrl = "https://go.microsoft.com/fwlink/?linkid=2271871"
-          $installerPath = "$env:TEMP\wdksetup.exe"
-          
-          Invoke-WebRequest -Uri $wdkUrl -OutFile $installerPath
-          
-          Write-Host "Installing WDK..."
-          $process = Start-Process -FilePath $installerPath -ArgumentList "/features + /q" -Wait -PassThru -NoNewWindow
-          
-          if ($process.ExitCode -ne 0) {
-            Write-Error "WDK installation failed with exit code: $($process.ExitCode)"
-            exit 1
-          }
-          Write-Host "WDK installed successfully."
-
       - name: Setup MSVC (x64)
         uses: ilammy/msvc-dev-cmd@v1
         with:
           arch: x64
 
-      - name: Verify Kernel Mode Libraries
+      - name: Install WDK via NuGet
         shell: pwsh
         run: |
-          $kmLibPath = "${env:ProgramFiles(x86)}\Windows Kits\10\Lib\10.0.26100.0\km\x64\ntoskrnl.lib"
-          if (-not (Test-Path $kmLibPath)) {
-            Write-Error "CRITICAL: ntoskrnl.lib not found at: $kmLibPath"
-            
-            # Диагностика: вывод фактически установленных версий SDK/WDK
-            Write-Host "Available Kit Lib directories:"
-            Get-ChildItem "${env:ProgramFiles(x86)}\Windows Kits\10\Lib" -Directory | Select-Object FullName
+          Write-Host "Installing Microsoft.Windows.WDK.x64 via nuget..."
+          nuget install Microsoft.Windows.WDK.x64 -Version 10.0.26100.2454 -OutputDirectory "$env:TEMP\wdk_nuget" -ExcludeVersion
+          
+          $nugetKmPath = "$env:TEMP\wdk_nuget\Microsoft.Windows.WDK.x64\build\native"
+          $targetKitLib = "${env:ProgramFiles(x86)}\Windows Kits\10\Lib\10.0.26100.0\km\x64"
+          $targetKitInc = "${env:ProgramFiles(x86)}\Windows Kits\10\Include\10.0.26100.0\km"
+
+          # Создаём директории в Windows Kits, если их нет
+          New-Item -ItemType Directory -Force -Path $targetKitLib | Out-Null
+          New-Item -ItemType Directory -Force -Path $targetKitInc | Out-Null
+
+          # Копируем библиотеки (включая ntoskrnl.lib) и инклуды ядра в стандартные пути Windows Kits
+          Copy-Item -Path "$nugetKmPath\lib\x64\*" -Destination $targetKitLib -Recurse -Force
+          Copy-Item -Path "$nugetKmPath\include\*" -Destination $targetKitInc -Recurse -Force
+
+          # Проверка
+          if (Test-Path "$targetKitLib\ntoskrnl.lib") {
+            Write-Host "SUCCESS: ntoskrnl.lib placed in $targetKitLib"
+          } else {
+            Write-Error "Failed to place ntoskrnl.lib"
             exit 1
           }
-          Write-Host "SUCCESS: Found $kmLibPath"
 
-      - name: Configure CMake (driver)
+      - name: Configure CMake
         shell: pwsh
         run: |
           cmake -S . -B build -G "Ninja" -DCMAKE_BUILD_TYPE=Release
 
       - name: Build driver (Release)
         shell: pwsh
-        run: |
-          cmake --build build --config Release --target esp_drv
+        run: cmake --build build --config Release --target esp_drv
 
       - name: Upload .sys artifact
         uses: actions/upload-artifact@v4
