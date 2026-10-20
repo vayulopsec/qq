@@ -208,13 +208,13 @@ static void Log(const char* fmt, ...) {
 
 // ---- physical read + CR3 page walker ----
 static BOOLEAN ReadPhysical(ULONG64 phys, PVOID buf, SIZE_T size) {
+    MM_COPY_ADDRESS src;
     PHYSICAL_ADDRESS pa;
+    SIZE_T copied = 0;
     pa.QuadPart = phys;
-    PVOID mapped = MmMapIoSpace(pa, size, MmNonCached);
-    if (!mapped) return FALSE;
-    RtlCopyMemory(buf, mapped, size);
-    MmUnmapIoSpace(mapped, size);
-    return TRUE;
+    src.PhysicalAddress = pa;
+    NTSTATUS st = MmCopyMemory(buf, src, size, MM_COPY_MEMORY_PHYSICAL, &copied);
+    return NT_SUCCESS(st) && copied == size;
 }
 
 static ULONG64 ReadPhysicalQword(ULONG64 phys) {
