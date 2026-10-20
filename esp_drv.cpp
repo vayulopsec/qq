@@ -9,6 +9,8 @@
 //   * No implicit new/delete  — all memory via ExAllocatePool2 / ExFreePoolWithTag.
 //   * No FP math in kernel    — no float/double arithmetic, only byte copies.
 //   * Mapper-safe globals     — all state reset explicitly in DriverEntry.
+//   * System-space sections   — shared/view mapped via MmMapViewInSystemSpace,
+//                               never into the mapper's process (fixes 0x1A).
 
 #include <ntifs.h>
 #include <ntddk.h>
@@ -95,9 +97,11 @@ typedef struct _SHARED_BLOCK {
 #pragma pack(pop)
 
 static HANDLE          g_hSharedSection = nullptr;
-static SHARED_BLOCK*   g_sharedVa = nullptr;
-static HANDLE          g_hViewSection = nullptr;
-static float*          g_viewVa = nullptr;
+static PVOID           g_sharedSecObj   = nullptr;
+static SHARED_BLOCK*   g_sharedVa       = nullptr;
+static HANDLE          g_hViewSection   = nullptr;
+static PVOID           g_viewSecObj     = nullptr;
+static float*          g_viewVa         = nullptr;
 
 static ULONG64         g_cs2Cr3 = 0;
 static ULONG64         g_clientBase = 0;
@@ -511,11 +515,32 @@ static NTSTATUS OpenOrCreateSection(PCWSTR nameStr, HANDLE* outHandle, LARGE_INT
     return st;
 }
 
+// ---- system-space mapping: адрес валиден из любого процесса (фикс 0x1A) ----
+static NTSTATUS MapSectionSystem(HANDLE h, SIZE_T size, PVOID* outVa, PVOID* outObj) {
+    PVOID obj = nullptr;
+    NTSTATUS st = ObReferenceObjectByHandle(h, SECTION_MAP_READ | SECTION_MAP_WRITE,
+                                            nullptr, KernelMode, &obj, nullptr);
+    if (!NT_SUCCESS(st)) return st;
+
+    PVOID base = nullptr;
+    SIZE_T vs = size;
+    st = MmMapViewInSystemSpace(obj, &base, &vs);
+    if (!NT_SUCCESS(st)) { ObDereferenceObject(obj); return st; }
+
+    *outVa = base;
+    *outObj = obj;
+    return STATUS_SUCCESS;
+}
+
+static void UnmapSectionSystem(PVOID* va, PVOID* obj) {
+    if (*va)  { MmUnmapViewInSystemSpace(*va); *va = nullptr; }
+    if (*obj) { ObDereferenceObject(*obj);     *obj = nullptr; }
+}
+
 static NTSTATUS CreateShared() {
     NTSTATUS st;
     LARGE_INTEGER sz;
     PVOID base = nullptr;
-    SIZE_T vs = 0;
     SECTION_BASIC_INFORMATION sbi = {};
 
     if (!g_sharedVa) {
@@ -525,16 +550,13 @@ static NTSTATUS CreateShared() {
 
         RtlZeroMemory(&sbi, sizeof(sbi));
         st = ZwQuerySection(g_hSharedSection, SectionBasicInformation, &sbi, sizeof(sbi), nullptr);
-        if (NT_SUCCESS(st)) {
-            if (sbi.Size.QuadPart < (ULONGLONG)sizeof(SHARED_BLOCK)) {
-                Log("shared: too small, stale section. Reboot required.");
-                ZwClose(g_hSharedSection); g_hSharedSection = nullptr;
-                return STATUS_INVALID_PARAMETER;
-            }
+        if (NT_SUCCESS(st) && sbi.Size.QuadPart < (ULONGLONG)sizeof(SHARED_BLOCK)) {
+            Log("shared: too small, stale section. Reboot required.");
+            ZwClose(g_hSharedSection); g_hSharedSection = nullptr;
+            return STATUS_INVALID_PARAMETER;
         }
 
-        base = nullptr; vs = 0;
-        st = ZwMapViewOfSection(g_hSharedSection, ZwCurrentProcess(), &base, 0, 0, nullptr, &vs, ViewUnmap, 0, PAGE_READWRITE);
+        st = MapSectionSystem(g_hSharedSection, sizeof(SHARED_BLOCK), &base, &g_sharedSecObj);
         if (!NT_SUCCESS(st)) { Log("MapView shared failed %x", (unsigned)st); return st; }
 
         g_sharedVa = (SHARED_BLOCK*)base;
@@ -549,16 +571,13 @@ static NTSTATUS CreateShared() {
 
         RtlZeroMemory(&sbi, sizeof(sbi));
         st = ZwQuerySection(g_hViewSection, SectionBasicInformation, &sbi, sizeof(sbi), nullptr);
-        if (NT_SUCCESS(st)) {
-            if (sbi.Size.QuadPart < 64ULL) {
-                Log("view: too small, stale section. Reboot required.");
-                ZwClose(g_hViewSection); g_hViewSection = nullptr;
-                return STATUS_INVALID_PARAMETER;
-            }
+        if (NT_SUCCESS(st) && sbi.Size.QuadPart < 64ULL) {
+            Log("view: too small, stale section. Reboot required.");
+            ZwClose(g_hViewSection); g_hViewSection = nullptr;
+            return STATUS_INVALID_PARAMETER;
         }
 
-        base = nullptr; vs = 0;
-        st = ZwMapViewOfSection(g_hViewSection, ZwCurrentProcess(), &base, 0, 0, nullptr, &vs, ViewUnmap, 0, PAGE_READWRITE);
+        st = MapSectionSystem(g_hViewSection, 0x1000, &base, &g_viewSecObj);
         if (!NT_SUCCESS(st)) { Log("MapView view failed %x", (unsigned)st); return st; }
 
         g_viewVa = (float*)base;
@@ -568,10 +587,10 @@ static NTSTATUS CreateShared() {
 }
 
 static void DestroyShared() {
-    if (g_viewVa && g_hViewSection)    { ZwUnmapViewOfSection(ZwCurrentProcess(), g_viewVa); g_viewVa = nullptr; }
-    if (g_hViewSection)                { ZwClose(g_hViewSection); g_hViewSection = nullptr; }
-    if (g_sharedVa && g_hSharedSection){ ZwUnmapViewOfSection(ZwCurrentProcess(), g_sharedVa); g_sharedVa = nullptr; }
-    if (g_hSharedSection)              { ZwClose(g_hSharedSection); g_hSharedSection = nullptr; }
+    UnmapSectionSystem((PVOID*)&g_viewVa, &g_viewSecObj);
+    if (g_hViewSection)   { ZwClose(g_hViewSection);   g_hViewSection = nullptr; }
+    UnmapSectionSystem((PVOID*)&g_sharedVa, &g_sharedSecObj);
+    if (g_hSharedSection) { ZwClose(g_hSharedSection); g_hSharedSection = nullptr; }
 }
 
 // Именованная функция вместо лямбды: без неявного преобразования и захвата.
@@ -588,8 +607,8 @@ static VOID DriverUnloadFn(PDRIVER_OBJECT) {
 
 extern "C" NTSTATUS DriverEntry(PDRIVER_OBJECT drv, PUNICODE_STRING) {
     // маппер может не обнулить .data/.bss, поэтому сбрасываем явно
-    g_hSharedSection = nullptr; g_sharedVa = nullptr;
-    g_hViewSection   = nullptr; g_viewVa   = nullptr;
+    g_hSharedSection = nullptr; g_sharedSecObj = nullptr; g_sharedVa = nullptr;
+    g_hViewSection   = nullptr; g_viewSecObj   = nullptr; g_viewVa   = nullptr;
     g_cs2Cr3 = 0; g_clientBase = 0; g_localPawn = 0; g_entitySystem = 0;
     g_stop = 0; g_workerThread = nullptr;
     g_logTick = 0; g_statReads = 0; g_statReadFails = 0;
@@ -602,8 +621,18 @@ extern "C" NTSTATUS DriverEntry(PDRIVER_OBJECT drv, PUNICODE_STRING) {
     HANDLE h = nullptr;
     st = PsCreateSystemThread(&h, THREAD_ALL_ACCESS, nullptr, nullptr, nullptr, WorkerThread, nullptr);
     if (!NT_SUCCESS(st)) { DestroyShared(); return st; }
-    ObReferenceObjectByHandle(h, THREAD_ALL_ACCESS, *PsThreadType, KernelMode, (PVOID*)&g_workerThread, nullptr);
+
+    st = ObReferenceObjectByHandle(h, THREAD_ALL_ACCESS, *PsThreadType, KernelMode,
+                                   (PVOID*)&g_workerThread, nullptr);
     ZwClose(h);
+    if (!NT_SUCCESS(st)) {
+        // поток уже запущен; без ссылки нельзя дождаться его на выгрузке, поэтому
+        // выставляем стоп и не выгружаемся. Для отладки это лучше, чем висящий поток.
+        InterlockedExchange(&g_stop, 1);
+        KeSetEvent(&g_workerEvent, 0, FALSE);
+        Log("ObReferenceObjectByHandle(thread) failed %x", (unsigned)st);
+        return st;
+    }
 
     Log("DriverEntry ok: shared=%p view=%p", g_sharedVa, g_viewVa);
 
