@@ -20,31 +20,18 @@ jobs:
         with:
           arch: x64
 
-      - name: Install WDK via NuGet
+      - name: Setup WDK
+        uses: eb/setup-wdk@v1
+
+      - name: Verify WDK files
         shell: pwsh
         run: |
-          Write-Host "Installing Microsoft.Windows.WDK.x64 via nuget..."
-          nuget install Microsoft.Windows.WDK.x64 -Version 10.0.26100.2454 -OutputDirectory "$env:TEMP\wdk_nuget" -ExcludeVersion
-          
-          $nugetKmPath = "$env:TEMP\wdk_nuget\Microsoft.Windows.WDK.x64\build\native"
-          $targetKitLib = "${env:ProgramFiles(x86)}\Windows Kits\10\Lib\10.0.26100.0\km\x64"
-          $targetKitInc = "${env:ProgramFiles(x86)}\Windows Kits\10\Include\10.0.26100.0\km"
-
-          # Создаём директории в Windows Kits, если их нет
-          New-Item -ItemType Directory -Force -Path $targetKitLib | Out-Null
-          New-Item -ItemType Directory -Force -Path $targetKitInc | Out-Null
-
-          # Копируем библиотеки (включая ntoskrnl.lib) и инклуды ядра в стандартные пути Windows Kits
-          Copy-Item -Path "$nugetKmPath\lib\x64\*" -Destination $targetKitLib -Recurse -Force
-          Copy-Item -Path "$nugetKmPath\include\*" -Destination $targetKitInc -Recurse -Force
-
-          # Проверка
-          if (Test-Path "$targetKitLib\ntoskrnl.lib") {
-            Write-Host "SUCCESS: ntoskrnl.lib placed in $targetKitLib"
-          } else {
-            Write-Error "Failed to place ntoskrnl.lib"
+          $foundLib = Get-ChildItem -Path "${env:ProgramFiles(x86)}\Windows Kits\10" -Filter "ntoskrnl.lib" -Recurse -ErrorAction SilentlyContinue | Select-Object -First 1
+          if (-not $foundLib) {
+            Write-Error "ntoskrnl.lib still not found in Windows Kits directory."
             exit 1
           }
+          Write-Host "Found ntoskrnl.lib at: $($foundLib.FullName)"
 
       - name: Configure CMake
         shell: pwsh
