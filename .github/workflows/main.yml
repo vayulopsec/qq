@@ -9,40 +9,89 @@ on:
 
 jobs:
   build-driver:
-    runs-on: windows-2022
+    runs-on: windows-latest
 
     steps:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Install WDK + Windows SDK
+      - name: Install WDK + Windows SDK (via VS Installer)
         shell: pwsh
         run: |
           $vsInstaller = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vs_installer.exe"
+          $vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
+
+          if (-not (Test-Path $vsInstaller)) {
+            Write-Error "vs_installer.exe not found at expected path"
+            exit 1
+          }
+
+          # Ищем экземпляр Visual Studio 2022 (версия 17.x), если он есть параллельно
+          $installPath = & $vswhere -version '[17.0,18.0)' -property installationPath
+
+          # Если VS 2022 не найдена, берём путь последней активной установки
+          if (-not $installPath) {
+            $installPath = & $vswhere -latest -property installationPath
+          }
+
+          if (-not $installPath) {
+            Write-Error "Visual Studio installation path could not be resolved via vswhere."
+            exit 1
+          }
+
+          Write-Host "Target VS path: $installPath"
+
           $args = @(
             'modify',
-            '--installPath', "${env:ProgramFiles}\Microsoft Visual Studio\2022\Enterprise",
+            '--installPath', "`"$installPath`"",
             '--add', 'Microsoft.VisualStudio.Component.WDK',
             '--add', 'Microsoft.VisualStudio.Component.Windows11SDK.26100',
             '--quiet', '--norestart', '--nocache'
           )
+
           Write-Host "Running: $vsInstaller $($args -join ' ')"
           $p = Start-Process -FilePath $vsInstaller -ArgumentList $args -Wait -PassThru -NoNewWindow
+
           if ($p.ExitCode -ne 0 -and $p.ExitCode -ne 3010) {
-            Write-Error "VS Installer exit code: $($p.ExitCode)"
+            Write-Error "VS Installer failed with exit code: $($p.ExitCode)"
+
+            # Вывод хвоста последнего лога установки для детальной диагностики ошибки
+            $logDir = "$env:TEMP"
+            $latestLog = Get-ChildItem -Path $logDir -Filter "dd_setup_*.log" | Sort-Object LastWriteTime -Descending | Select-Object -First 1
+            if ($latestLog) {
+              Write-Host "`n=== VS Installer Log: $($latestLog.FullName) ===" -ForegroundColor Yellow
+              Get-Content $latestLog.FullName -Tail 60
+            } else {
+              Write-Warning "Setup log file (dd_setup_*.log) not found in $logDir"
+            }
             exit 1
           }
-          Write-Host "WDK installed"
+
+          Write-Host "WDK and SDK components installed successfully."
 
       - name: Setup MSVC (x64)
         uses: ilammy/msvc-dev-cmd@v1
         with:
           arch: x64
 
-      - name: Configure CMake
+      - name: Verify WDK paths
         shell: pwsh
         run: |
-          cmake -S . -B build -G "Visual Studio 17 2022" -A x64
+          $wdkRoot = "${env:ProgramFiles(x86)}\Windows Kits\10"
+          if (-not (Test-Path $wdkRoot)) {
+            Write-Error "Windows Kits directory not found: $wdkRoot"
+            exit 1
+          }
+          Write-Host "Includes found in Windows Kits:"
+          Get-ChildItem "$wdkRoot\Include" | Select-Object -ExpandProperty Name
+          Write-Host "Libs found in Windows Kits:"
+          Get-ChildItem "$wdkRoot\Lib" | Select-Object -ExpandProperty Name
+
+      - name: Configure CMake (driver)
+        shell: pwsh
+        run: |
+          # В среде msvc-dev-cmd сборка драйвера через Ninja работает напрямую с флагами компилятора
+          cmake -S . -B build -G "Ninja" -DCMAKE_BUILD_TYPE=Release
 
       - name: Build driver (Release)
         shell: pwsh
