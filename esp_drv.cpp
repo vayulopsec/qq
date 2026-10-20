@@ -521,7 +521,7 @@ static VOID WorkerThread(PVOID) {
 
 // Self-relative SD с DACL = 1 ACE (Everyone: GENERIC_ALL).
 // Null-DACL в kernel-mode ZwCreateSection иногда даёт AV внутри SeAssignSecurity → BSOD 0x1E.
-static NTSTATUS BuildEveryoneSd(PSECURITY_DESCRIPTOR sd, PVOID* outAcl) {
+static NTSTATUS BuildEveryoneSd(PISECURITY_DESCRIPTOR sd, PVOID* outAcl) {
     PUCHAR p = (PUCHAR)sd;
     RtlZeroMemory(p, 0x50);
 
@@ -570,7 +570,7 @@ static NTSTATUS OpenOrCreateSection(PCWSTR nameStr, HANDLE* outHandle, LARGE_INT
     UCHAR sdBuf[0x80];
     PSECURITY_DESCRIPTOR sd = (PSECURITY_DESCRIPTOR)sdBuf;
     PVOID aclUnused = nullptr;
-    st = BuildEveryoneSd(sd, &aclUnused);
+    st = BuildEveryoneSd((PISECURITY_DESCRIPTOR)sd, &aclUnused);
     if (!NT_SUCCESS(st)) return st;
 
     RtlInitUnicodeString(&name, nameStr);
