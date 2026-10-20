@@ -11,7 +11,7 @@
 #include <ntifs.h>
 #include <ntddk.h>
 #include <intrin.h>
-#include <vadefs.h>
+#include <vadefs.h> // добавил
 
 extern "C" NTSTATUS ZwQuerySystemInformation(
     ULONG SystemInformationClass,
