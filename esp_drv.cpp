@@ -11,7 +11,6 @@
 #include <ntifs.h>
 #include <ntddk.h>
 #include <intrin.h>
-#include <ntstrsafe.h>
 
 extern "C" NTSTATUS ZwQuerySystemInformation(
     ULONG SystemInformationClass,
@@ -90,20 +89,112 @@ static volatile LONG   g_logTick = 0;
 static volatile LONG   g_statReads = 0;
 static volatile LONG   g_statReadFails = 0;
 
+// ---------------------------------------------------------------------------
+// Мини-форматтер для kernel-mode: без UCRT, без ntstrsafe-vprintf.
+// Поддерживает %s %c %d %i %u %x %X %p %ld %lu %lx %lld %llu %llx %f
+// ---------------------------------------------------------------------------
+static char* KAppendChar(char* p, char* end, char c) {
+    if (p < end) *p++ = c;
+    return p;
+}
+
+static char* KAppendStr(char* p, char* end, const char* s) {
+    if (!s) s = "(null)";
+    while (*s && p < end) *p++ = *s++;
+    return p;
+}
+
+static char* KAppendUInt(char* p, char* end, unsigned long long v, unsigned base, bool upper) {
+    char tmp[32];
+    int n = 0;
+    const char* digits = upper ? "0123456789ABCDEF" : "0123456789abcdef";
+    if (v == 0) tmp[n++] = '0';
+    while (v && n < (int)sizeof(tmp)) { tmp[n++] = digits[v % base]; v /= base; }
+    while (n > 0 && p < end) *p++ = tmp[--n];
+    return p;
+}
+
+static char* KAppendInt(char* p, char* end, long long v) {
+    if (v < 0) { p = KAppendChar(p, end, '-'); return KAppendUInt(p, end, (unsigned long long)(-v), 10, false); }
+    return KAppendUInt(p, end, (unsigned long long)v, 10, false);
+}
+
+static char* KAppendFloat(char* p, char* end, double v, int prec) {
+    if (v != v) return KAppendStr(p, end, "nan");
+    if (v < 0) { p = KAppendChar(p, end, '-'); v = -v; }
+    unsigned long long ip = (unsigned long long)v;
+    double frac = v - (double)ip;
+    p = KAppendUInt(p, end, ip, 10, false);
+    if (prec > 0) {
+        p = KAppendChar(p, end, '.');
+        for (int i = 0; i < prec; ++i) {
+            frac *= 10.0;
+            int d = (int)frac;
+            p = KAppendChar(p, end, (char)('0' + d));
+            frac -= d;
+        }
+    }
+    return p;
+}
+
+static void KVPrintf(char* out, SIZE_T outCap, const char* fmt, va_list ap) {
+    if (!out || outCap == 0) return;
+    char* p = out;
+    char* end = out + outCap - 1;
+    while (*fmt && p < end) {
+        if (*fmt != '%') { *p++ = *fmt++; continue; }
+        ++fmt;
+        int lcount = 0;
+        while (*fmt == 'l') { ++lcount; ++fmt; }
+        bool isLongLong = (lcount >= 2);
+        if (*fmt == 'X') { ++fmt;
+            unsigned long long v = isLongLong ? va_arg(ap, unsigned long long)
+                                              : (unsigned long long)va_arg(ap, unsigned int);
+            p = KAppendUInt(p, end, v, 16, true); continue; }
+        if (*fmt == 'x') { ++fmt;
+            unsigned long long v = isLongLong ? va_arg(ap, unsigned long long)
+                                              : (unsigned long long)va_arg(ap, unsigned int);
+            p = KAppendUInt(p, end, v, 16, false); continue; }
+        if (*fmt == 'u') { ++fmt;
+            unsigned long long v = isLongLong ? va_arg(ap, unsigned long long)
+                                              : (unsigned long long)va_arg(ap, unsigned int);
+            p = KAppendUInt(p, end, v, 10, false); continue; }
+        if (*fmt == 'd' || *fmt == 'i') { ++fmt;
+            long long v = isLongLong ? va_arg(ap, long long)
+                                     : (long long)va_arg(ap, int);
+            p = KAppendInt(p, end, v); continue; }
+        if (*fmt == 'p') { ++fmt;
+            p = KAppendStr(p, end, "0x");
+            p = KAppendUInt(p, end, (unsigned long long)(ULONG_PTR)va_arg(ap, void*), 16, false);
+            continue; }
+        if (*fmt == 's') { ++fmt; p = KAppendStr(p, end, va_arg(ap, const char*)); continue; }
+        if (*fmt == 'c') { ++fmt; p = KAppendChar(p, end, (char)va_arg(ap, int)); continue; }
+        if (*fmt == 'f') { ++fmt; p = KAppendFloat(p, end, va_arg(ap, double), 3); continue; }
+        p = KAppendChar(p, end, '%');
+        if (*fmt) p = KAppendChar(p, end, *fmt++);
+    }
+    *p = 0;
+}
+
 static void LogRaw(const char* text) {
     DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL, "[esp_drv] %s\n", text);
     if (!g_sharedVa) return;
     LONG tail = InterlockedIncrement(&g_sharedVa->log.tail) - 1;
     LONG slot = tail % MAX_LOGS;
     g_sharedVa->log.entries[slot].tick = (ULONG)InterlockedIncrement(&g_logTick);
-    RtlStringCchCopyA(g_sharedVa->log.entries[slot].text, LOG_LINE_MAX, text);
+    // копируем вручную, без RtlStringCchCopyA (она тоже может тянуть UCRT)
+    char* dst = g_sharedVa->log.entries[slot].text;
+    const char* src = text;
+    SIZE_T n = 0;
+    while (*src && n < LOG_LINE_MAX - 1) { dst[n++] = *src++; }
+    dst[n] = 0;
 }
 
 static void Log(const char* fmt, ...) {
     char buf[LOG_LINE_MAX];
     va_list ap;
     va_start(ap, fmt);
-    RtlStringCchVPrintfA(buf, sizeof(buf), fmt, ap);
+    KVPrintf(buf, sizeof(buf), fmt, ap);
     va_end(ap);
     LogRaw(buf);
 }
