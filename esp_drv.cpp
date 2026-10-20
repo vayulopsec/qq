@@ -499,10 +499,16 @@ static VOID WorkerThread(PVOID) {
     }
 }
 
-// ---- shared memory ----
 static NTSTATUS BuildNullDaclSD(PSECURITY_DESCRIPTOR sd) {
-    if (!NT_SUCCESS(RtlCreateSecurityDescriptor(sd, SECURITY_DESCRIPTOR_REVISION))) return STATUS_UNSUCCESSFUL;
-    if (!NT_SUCCESS(RtlSetDaclSecurityDescriptor(sd, TRUE, nullptr, FALSE))) return STATUS_UNSUCCESSFUL;
+    // Self-relative SD с null-DACL — вручную.
+    // RtlSetDaclSecurityDescriptor в kernel-mode не всегда выставляет SE_SELF_RELATIVE,
+    // из-за чего ZwCreateSection возвращает STATUS_INVALID_SECURITY_DESCR (0xC000001F).
+    PUCHAR p = (PUCHAR)sd;
+    RtlZeroMemory(p, sizeof(SECURITY_DESCRIPTOR));
+    p[0] = SECURITY_DESCRIPTOR_REVISION;
+    p[1] = 0;
+    *(USHORT*)(p + 2) = (USHORT)(SE_SELF_RELATIVE | SE_DACL_PRESENT);
+    // Owner, Group, Sacl, Dacl — все 0 (смещения = 0 → отсутствуют)
     return STATUS_SUCCESS;
 }
 
