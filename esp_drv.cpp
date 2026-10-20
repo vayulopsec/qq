@@ -152,12 +152,22 @@ typedef struct _SYSTEM_PROCESS_INFO {
     LARGE_INTEGER OtherTransferCount;
 } SYSTEM_PROCESS_INFO, *PSYSTEM_PROCESS_INFO;
 
+extern "C" NTSTATUS ZwQuerySystemInformation(
+    ULONG SystemInformationClass,
+    PVOID SystemInformation,
+    ULONG SystemInformationLength,
+    PULONG ReturnLength
+);
+
+// The SystemProcessInformation class value used in the code is 5, can define a constant
+#define SystemProcessInformation 5
+
 static PEPROCESS FindCs2Process() {
     ULONG size = 0x10000;
     PVOID buf = nullptr;
     NTSTATUS st;
     for (int i = 0; i < 4; ++i) {
-        buf = ExAllocatePoolWithTag(NonPagedPool, size, POOL_TAG);
+        buf = ExAllocatePool2(POOL_FLAG_NON_PAGED, size, POOL_TAG);
         if (!buf) return nullptr;
         st = ZwQuerySystemInformation(5, buf, size, &size);
         if (NT_SUCCESS(st)) break;
