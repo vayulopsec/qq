@@ -499,16 +499,46 @@ static VOID WorkerThread(PVOID) {
     }
 }
 
-static NTSTATUS BuildNullDaclSD(PSECURITY_DESCRIPTOR sd) {
-    // Self-relative SD с null-DACL — вручную.
-    // RtlSetDaclSecurityDescriptor в kernel-mode не всегда выставляет SE_SELF_RELATIVE,
-    // из-за чего ZwCreateSection возвращает STATUS_INVALID_SECURITY_DESCR (0xC000001F).
+// Self-relative SD с DACL = 1 ACE (Everyone: GENERIC_ALL).
+// Null-DACL в kernel-mode ZwCreateSection иногда даёт AV внутри SeAssignSecurity → BSOD 0x1E.
+static NTSTATUS BuildEveryoneSd(PSECURITY_DESCRIPTOR sd, PVOID* outAcl) {
     PUCHAR p = (PUCHAR)sd;
-    RtlZeroMemory(p, sizeof(SECURITY_DESCRIPTOR));
-    p[0] = SECURITY_DESCRIPTOR_REVISION;
-    p[1] = 0;
-    *(USHORT*)(p + 2) = (USHORT)(SE_SELF_RELATIVE | SE_DACL_PRESENT);
-    // Owner, Group, Sacl, Dacl — все 0 (смещения = 0 → отсутствуют)
+    RtlZeroMemory(p, 0x50);
+
+    PACL acl = (PACL)(p + sizeof(SECURITY_DESCRIPTOR));
+    PSID sid = (PSID)((PUCHAR)acl + 0x10 + 0x0C);
+
+    sid->Revision = 1;
+    sid->SubAuthorityCount = 1;
+    sid->IdentifierAuthority.Value[0] = 0;
+    sid->IdentifierAuthority.Value[1] = 0;
+    sid->IdentifierAuthority.Value[2] = 0;
+    sid->IdentifierAuthority.Value[3] = 0;
+    sid->IdentifierAuthority.Value[4] = 0;
+    sid->IdentifierAuthority.Value[5] = 1;
+    sid->SubAuthority[0] = 0;
+
+    acl->AclRevision = ACL_REVISION;
+    acl->Sbz1 = 0;
+    acl->AclSize = 0x10 + 0x0C + 8;
+    acl->AceCount = 1;
+    acl->Sbz2 = 0;
+
+    PACCESS_ALLOWED_ACE ace = (PACCESS_ALLOWED_ACE)((PUCHAR)acl + 0x10);
+    ace->Header.AceType  = ACCESS_ALLOWED_ACE_TYPE;
+    ace->Header.AceFlags = 0;
+    ace->Header.AceSize  = 0x0C + 8;
+    ace->Mask            = 0xFFFFFFFF;
+
+    sd->Revision = SECURITY_DESCRIPTOR_REVISION;
+    sd->Sbz1 = 0;
+    sd->Control = (USHORT)(SE_SELF_RELATIVE | SE_DACL_PRESENT);
+    sd->Owner = nullptr;
+    sd->Group = nullptr;
+    sd->Sacl  = nullptr;
+    sd->Dacl  = acl;
+
+    if (outAcl) *outAcl = acl;
     return STATUS_SUCCESS;
 }
 
@@ -516,18 +546,21 @@ static NTSTATUS OpenOrCreateSection(PCWSTR nameStr, HANDLE* outHandle, LARGE_INT
     NTSTATUS st;
     UNICODE_STRING name;
     OBJECT_ATTRIBUTES oa;
-    SECURITY_DESCRIPTOR sd;
 
-    st = BuildNullDaclSD(&sd);
+    UCHAR sdBuf[0x80];
+    PSECURITY_DESCRIPTOR sd = (PSECURITY_DESCRIPTOR)sdBuf;
+    PVOID aclUnused = nullptr;
+    st = BuildEveryoneSd(sd, &aclUnused);
     if (!NT_SUCCESS(st)) return st;
 
     RtlInitUnicodeString(&name, nameStr);
-    InitializeObjectAttributes(&oa, &name, OBJ_CASE_INSENSITIVE | OBJ_KERNEL_HANDLE, nullptr, &sd);
+    InitializeObjectAttributes(&oa, &name, OBJ_CASE_INSENSITIVE | OBJ_KERNEL_HANDLE, nullptr, sd);
+
+    DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL, "[esp_drv] OpenOrCreateSection(%ws) before ZwCreateSection\n", nameStr);
     st = ZwCreateSection(outHandle, SECTION_ALL_ACCESS, &oa, &size, PAGE_READWRITE, SEC_COMMIT, nullptr);
+    DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL, "[esp_drv] OpenOrCreateSection(%ws) ZwCreateSection st=%08x\n", nameStr, st);
 
     if (st == STATUS_OBJECT_NAME_COLLISION) {
-        // Секция уже существует (например, kdmapper до этого уже грузил драйвер).
-        // Открываем существующую — это исправляет DriverEntry → 0xC0000035.
         Log("section exists, opening instead");
         InitializeObjectAttributes(&oa, &name, OBJ_CASE_INSENSITIVE | OBJ_KERNEL_HANDLE, nullptr, nullptr);
         st = ZwOpenSection(outHandle, SECTION_ALL_ACCESS, &oa);
@@ -540,15 +573,31 @@ static NTSTATUS CreateShared() {
     LARGE_INTEGER sz;
     PVOID base = nullptr;
     SIZE_T vs = 0;
+    SECTION_BASIC_INFORMATION sbi = {};
 
-    // ---------- shared (большая секция) ----------
+    // ---------- shared ----------
     if (!g_sharedVa) {
         sz.QuadPart = sizeof(SHARED_BLOCK);
         st = OpenOrCreateSection(L"\\BaseNamedObjects\\Cs2EspShared_v1", &g_hSharedSection, sz);
         if (!NT_SUCCESS(st)) { Log("CreateSection shared failed %x", (unsigned)st); return st; }
 
+        RtlZeroMemory(&sbi, sizeof(sbi));
+        st = ZwQuerySection(g_hSharedSection, SectionBasicInformation, &sbi, sizeof(sbi), nullptr);
+        if (NT_SUCCESS(st)) {
+            Log("shared: MaximumSize=%llx need=%llx",
+                (unsigned long long)sbi.MaximumSize.QuadPart,
+                (unsigned long long)sizeof(SHARED_BLOCK));
+            if (sbi.MaximumSize.QuadPart < (ULONGLONG)sizeof(SHARED_BLOCK)) {
+                Log("shared: too small, stale section. Reboot required.");
+                ZwClose(g_hSharedSection); g_hSharedSection = nullptr;
+                return STATUS_INVALID_PARAMETER;
+            }
+        }
+
         base = nullptr; vs = 0;
+        DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL, "[esp_drv] shared before MapView\n");
         st = ZwMapViewOfSection(g_hSharedSection, ZwCurrentProcess(), &base, 0, 0, nullptr, &vs, ViewUnmap, 0, PAGE_READWRITE);
+        DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL, "[esp_drv] shared after MapView st=%08x base=%p\n", st, base);
         if (!NT_SUCCESS(st)) { Log("MapView shared failed %x", (unsigned)st); return st; }
 
         g_sharedVa = (SHARED_BLOCK*)base;
@@ -556,14 +605,28 @@ static NTSTATUS CreateShared() {
         g_sharedVa->hdr.maxEntities = MAX_ENTITIES;
     }
 
-    // ---------- view (маленькая секция) ----------
+    // ---------- view ----------
     if (!g_viewVa) {
-        sz.QuadPart = 0x1000;   // 4096 — кратно странице, надёжнее 64
+        sz.QuadPart = 0x1000;
         st = OpenOrCreateSection(L"\\BaseNamedObjects\\Cs2EspView_v1", &g_hViewSection, sz);
         if (!NT_SUCCESS(st)) { Log("CreateSection view failed %x", (unsigned)st); return st; }
 
+        RtlZeroMemory(&sbi, sizeof(sbi));
+        st = ZwQuerySection(g_hViewSection, SectionBasicInformation, &sbi, sizeof(sbi), nullptr);
+        if (NT_SUCCESS(st)) {
+            Log("view: MaximumSize=%llx need>=40",
+                (unsigned long long)sbi.MaximumSize.QuadPart);
+            if (sbi.MaximumSize.QuadPart < 64ULL) {
+                Log("view: too small, stale section. Reboot required.");
+                ZwClose(g_hViewSection); g_hViewSection = nullptr;
+                return STATUS_INVALID_PARAMETER;
+            }
+        }
+
         base = nullptr; vs = 0;
+        DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL, "[esp_drv] view before MapView\n");
         st = ZwMapViewOfSection(g_hViewSection, ZwCurrentProcess(), &base, 0, 0, nullptr, &vs, ViewUnmap, 0, PAGE_READWRITE);
+        DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL, "[esp_drv] view after MapView st=%08x base=%p\n", st, base);
         if (!NT_SUCCESS(st)) { Log("MapView view failed %x", (unsigned)st); return st; }
 
         g_viewVa = (float*)base;
