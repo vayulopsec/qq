@@ -4,22 +4,38 @@ project(esp_drv CXX)
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
+# ---------------------------------------------------------------------------
+# Убираем дефолтный /EHsc, который CMake добавляет для MSVC.
+# Без этого получим warning D9025 при использовании /EHs-c-.
+# ---------------------------------------------------------------------------
+if(MSVC)
+    string(REGEX REPLACE "/EHsc" "" CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS}")
+endif()
+
+# ---------------------------------------------------------------------------
 # Ищем WDK
+# ---------------------------------------------------------------------------
 set(WDK_ROOT "$ENV{ProgramFiles\(x86\)}/Windows Kits/10" CACHE PATH "WDK root")
 if (NOT EXISTS "${WDK_ROOT}/Include")
     message(FATAL_ERROR "WDK not found at ${WDK_ROOT}")
 endif()
 
-# Берём версию WDK из самой старшей папки Include
+# Берём самую новую версию WDK (natural sort, по убыванию)
 file(GLOB WDK_VERSIONS LIST_DIRECTORIES true "${WDK_ROOT}/Include/10.*")
-list(SORT WDK_VERSIONS)
-list(GET WDK_VERSIONS -1 WDK_VERSION_DIR)
+if (NOT WDK_VERSIONS)
+    message(FATAL_ERROR "No WDK versions found in ${WDK_ROOT}/Include")
+endif()
+list(SORT WDK_VERSIONS COMPARE NATURAL ORDER DESCENDING)
+list(GET WDK_VERSIONS 0 WDK_VERSION_DIR)
 get_filename_component(WDK_VERSION "${WDK_VERSION_DIR}" NAME)
 message(STATUS "Using WDK ${WDK_VERSION}")
 
 set(WDK_INC "${WDK_ROOT}/Include/${WDK_VERSION}")
 set(WDK_LIB "${WDK_ROOT}/Lib/${WDK_VERSION}/km/x64")
 
+# ---------------------------------------------------------------------------
+# Цель
+# ---------------------------------------------------------------------------
 add_executable(esp_drv esp_drv.cpp)
 
 target_include_directories(esp_drv PRIVATE
@@ -37,24 +53,24 @@ target_compile_definitions(esp_drv PRIVATE
     POOL_NX_OPTIN=1
     NTDDI_VERSION=0x0A00000C   # Win10 22H2+
     _WIN32_WINNT=0x0A00
+    _AMD64_
 )
 
 target_compile_options(esp_drv PRIVATE
     /kernel           # kernel mode
     /GS-              # no stack cookies
     /GR-              # no RTTI
-    /EHs-c-           # no C++ exceptions
+    /EHs-c-           # no C++ exceptions (synchronous)
+    /EHc-             # no C++ exceptions (extern "C" defaults)
     /Zl               # no default lib (manual map friendly)
     /O2
     /W3
-    /D_AMD64_
 )
 
 target_link_options(esp_drv PRIVATE
     /DRIVER
     /SUBSYSTEM:NATIVE
     /ENTRY:DriverEntry
-    /NODEFAULTLIB
     /MACHINE:X64
     /IGNORE:4001,4037,4039,4065,4070,4078,4087,4089,4198,4221,4226
 )
