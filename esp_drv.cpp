@@ -112,7 +112,6 @@ static volatile LONG   g_statReadFails = 0;
 
 // ---------------------------------------------------------------------------
 // Мини-форматтер для kernel-mode: без UCRT, без ntstrsafe-vprintf.
-// Поддерживает %s %c %d %i %u %x %X %p %ld %lu %lx %lld %llu %llx %f
 // ---------------------------------------------------------------------------
 static char* KAppendChar(char* p, char* end, char c) {
     if (p < end) *p++ = c;
@@ -203,7 +202,6 @@ static void LogRaw(const char* text) {
     LONG tail = InterlockedIncrement(&g_sharedVa->log.tail) - 1;
     LONG slot = tail % MAX_LOGS;
     g_sharedVa->log.entries[slot].tick = (ULONG)InterlockedIncrement(&g_logTick);
-    // копируем вручную, без RtlStringCchCopyA (она тоже может тянуть UCRT)
     char* dst = g_sharedVa->log.entries[slot].text;
     const char* src = text;
     SIZE_T n = 0;
@@ -270,50 +268,23 @@ static BOOLEAN ReadCs2Memory(ULONG64 va, PVOID buf, SIZE_T size) {
 
 static BOOLEAN RdQ(ULONG64 va, PULONG64 out) { return ReadCs2Memory(va, out, 8); }
 static BOOLEAN RdD(ULONG64 va, PULONG   out) { return ReadCs2Memory(va, out, 4); }
-static BOOLEAN RdB(ULONG64 va, PUCHAR   out) { return ReadCs2Memory(va, out, 1); }
 
 // ---- process / module discovery ----
 typedef struct _SYSTEM_PROCESS_INFO {
-    ULONG NextEntryOffset;
-    ULONG NumberOfThreads;
-    LARGE_INTEGER WorkingSetPrivateSize;
-    ULONG HardFaultCount;
-    ULONG NumberOfThreadsHighWatermark;
-    ULONGLONG CycleTime;
-    LARGE_INTEGER CreateTime;
-    LARGE_INTEGER UserTime;
-    LARGE_INTEGER KernelTime;
-    UNICODE_STRING ImageName;
-    KPRIORITY BasePriority;
-    HANDLE UniqueProcessId;
-    HANDLE InheritedFromUniqueProcessId;
-    ULONG HandleCount;
-    ULONG SessionId;
-    ULONG_PTR UniqueProcessKey;
-    SIZE_T PeakVirtualSize;
-    SIZE_T VirtualSize;
-    ULONG PageFaultCount;
-    SIZE_T PeakWorkingSetSize;
-    SIZE_T WorkingSetSize;
-    SIZE_T QuotaPeakPagedPoolUsage;
-    SIZE_T QuotaPagedPoolUsage;
-    SIZE_T QuotaPeakNonPagedPoolUsage;
-    SIZE_T QuotaNonPagedPoolUsage;
-    SIZE_T PagefileUsage;
-    SIZE_T PeakPagefileUsage;
-    SIZE_T PrivatePageCount;
-    LARGE_INTEGER ReadOperationCount;
-    LARGE_INTEGER WriteOperationCount;
-    LARGE_INTEGER OtherOperationCount;
-    LARGE_INTEGER ReadTransferCount;
-    LARGE_INTEGER WriteTransferCount;
-    LARGE_INTEGER OtherTransferCount;
+    ULONG NextEntryOffset; ULONG NumberOfThreads; LARGE_INTEGER WorkingSetPrivateSize; ULONG HardFaultCount;
+    ULONG NumberOfThreadsHighWatermark; ULONGLONG CycleTime; LARGE_INTEGER CreateTime; LARGE_INTEGER UserTime;
+    LARGE_INTEGER KernelTime; UNICODE_STRING ImageName; KPRIORITY BasePriority; HANDLE UniqueProcessId;
+    HANDLE InheritedFromUniqueProcessId; ULONG HandleCount; ULONG SessionId; ULONG_PTR UniqueProcessKey;
+    SIZE_T PeakVirtualSize; SIZE_T VirtualSize; ULONG PageFaultCount; SIZE_T PeakWorkingSetSize;
+    SIZE_T WorkingSetSize; SIZE_T QuotaPeakPagedPoolUsage; SIZE_T QuotaPagedPoolUsage;
+    SIZE_T QuotaPeakNonPagedPoolUsage; SIZE_T QuotaNonPagedPoolUsage; SIZE_T PagefileUsage;
+    SIZE_T PeakPagefileUsage; SIZE_T PrivatePageCount; LARGE_INTEGER ReadOperationCount;
+    LARGE_INTEGER WriteOperationCount; LARGE_INTEGER OtherOperationCount; LARGE_INTEGER ReadTransferCount;
+    LARGE_INTEGER WriteTransferCount; LARGE_INTEGER OtherTransferCount;
 } SYSTEM_PROCESS_INFO, *PSYSTEM_PROCESS_INFO;
 
 static PEPROCESS FindCs2Process() {
-    ULONG size = 0x10000;
-    PVOID buf = nullptr;
-    NTSTATUS st = STATUS_INFO_LENGTH_MISMATCH;
+    ULONG size = 0x10000; PVOID buf = nullptr; NTSTATUS st = STATUS_INFO_LENGTH_MISMATCH;
     for (int i = 0; i < 4; ++i) {
         buf = ExAllocatePool2(POOL_FLAG_NON_PAGED, size, POOL_TAG);
         if (!buf) return nullptr;
@@ -324,7 +295,6 @@ static PEPROCESS FindCs2Process() {
         size *= 2;
     }
     if (!buf) return nullptr;
-
     ANSI_STRING target; RtlInitAnsiString(&target, "cs2.exe");
     PSYSTEM_PROCESS_INFO spi = (PSYSTEM_PROCESS_INFO)buf;
     PEPROCESS found = nullptr;
@@ -347,69 +317,44 @@ static PEPROCESS FindCs2Process() {
     return found;
 }
 
-static ULONG64 GetProcessCr3(PEPROCESS p) {
-    return *(ULONG64*)((PUCHAR)p + 0x28);
-}
+static ULONG64 GetProcessCr3(PEPROCESS p) { return *(ULONG64*)((PUCHAR)p + 0x28); }
 
 typedef struct _LDR_ENTRY_OFF {
-    LIST_ENTRY InLoadOrderLinks;
-    PVOID ExceptionTable;
-    ULONG ExceptionTableSize;
-    PVOID GpValue;
-    PVOID NonPagedDebugInfo;
-    PVOID DllBase;
-    PVOID EntryPoint;
-    ULONG SizeOfImage;
-    UNICODE_STRING FullDllName;
-    UNICODE_STRING BaseDllName;
+    LIST_ENTRY InLoadOrderLinks; PVOID ExceptionTable; ULONG ExceptionTableSize; PVOID GpValue;
+    PVOID NonPagedDebugInfo; PVOID DllBase; PVOID EntryPoint; ULONG SizeOfImage;
+    UNICODE_STRING FullDllName; UNICODE_STRING BaseDllName;
 } LDR_ENTRY_OFF;
 
 static ULONG64 FindModuleBase(PEPROCESS proc, PCWSTR moduleName) {
-    ULONG64 peb = 0;
-    UNICODE_STRING fnName; RtlInitUnicodeString(&fnName, L"PsGetProcessPeb");
-    typedef PVOID(*fnPeb)(PEPROCESS);
-    fnPeb fn = (fnPeb)MmGetSystemRoutineAddress(&fnName);
-    if (fn) peb = (ULONG64)fn(proc);
-    if (!peb) return 0;
-
-    ULONG64 ldr = 0;
-    if (!RdQ(peb + 0x18, &ldr) || !ldr) return 0;
-    ULONG64 head = ldr + 0x10;
-    ULONG64 cur = 0;
-    if (!RdQ(head, &cur)) return 0;
+    ULONG64 peb = 0; UNICODE_STRING fnName; RtlInitUnicodeString(&fnName, L"PsGetProcessPeb");
+    typedef PVOID(*fnPeb)(PEPROCESS); fnPeb fn = (fnPeb)MmGetSystemRoutineAddress(&fnName);
+    if (fn) peb = (ULONG64)fn(proc); if (!peb) return 0;
+    ULONG64 ldr = 0; if (!RdQ(peb + 0x18, &ldr) || !ldr) return 0;
+    ULONG64 head = ldr + 0x10; ULONG64 cur = 0; if (!RdQ(head, &cur)) return 0;
     for (int guard = 0; guard < 512 && cur && cur != head; ++guard) {
-        LDR_ENTRY_OFF e = {};
-        if (!ReadCs2Memory(cur, &e, sizeof(e))) return 0;
+        LDR_ENTRY_OFF e = {}; if (!ReadCs2Memory(cur, &e, sizeof(e))) return 0;
         if (e.BaseDllName.Buffer && e.BaseDllName.Length) {
-            WCHAR n[128] = {};
-            USHORT len = e.BaseDllName.Length;
+            WCHAR n[128] = {}; USHORT len = e.BaseDllName.Length;
             if (len > sizeof(n) - sizeof(WCHAR)) len = sizeof(n) - sizeof(WCHAR);
             if (ReadCs2Memory((ULONG64)e.BaseDllName.Buffer, n, len)) {
                 n[len / sizeof(WCHAR)] = 0;
                 if (_wcsicmp(n, moduleName) == 0) return (ULONG64)e.DllBase;
             }
         }
-        ULONG64 next = 0;
-        if (!RdQ(cur, &next)) return 0;
-        cur = next;
+        ULONG64 next = 0; if (!RdQ(cur, &next)) return 0; cur = next;
     }
     return 0;
 }
 
-// ---- GetEntityByIndex (same as main.cpp) ----
+// ---- GetEntityByIndex ----
 static ULONG64 EntityByIndex(ULONG64 es, ULONG idx) {
     if (!es || idx > 0x7FFE) return 0;
-    ULONG c = idx >> 9;
-    if (c > 0x3F) return 0;
-    ULONG64 chunk = 0;
-    if (!RdQ(es + 0x10 + 8ULL * c, &chunk) || !chunk) return 0;
+    ULONG c = idx >> 9; if (c > 0x3F) return 0;
+    ULONG64 chunk = 0; if (!RdQ(es + 0x10 + 8ULL * c, &chunk) || !chunk) return 0;
     ULONG64 entry = chunk + 112ULL * (idx & 0x1FF);
-    ULONG ident = 0;
-    if (!RdD(entry + 0x10, &ident)) return 0;
+    ULONG ident = 0; if (!RdD(entry + 0x10, &ident)) return 0;
     if ((ident & 0x7FFF) != idx) return 0;
-    ULONG64 ent = 0;
-    if (!RdQ(entry, &ent)) return 0;
-    return ent;
+    ULONG64 ent = 0; if (!RdQ(entry, &ent)) return 0; return ent;
 }
 
 static void ClearShared() {
@@ -421,9 +366,8 @@ static void ClearShared() {
 
 static void Tick() {
     static ULONG s_lastLog = 0;
-    ULONG now = (ULONG)InterlockedIncrement(&g_logTick) / 100; // ~раз в секунду при 10ms тике
-    bool logNow = (now != s_lastLog);
-    if (logNow) s_lastLog = now;
+    ULONG now = (ULONG)InterlockedIncrement(&g_logTick) / 100;
+    bool logNow = (now != s_lastLog); if (logNow) s_lastLog = now;
 
     USHORT mz = 0;
     bool baseAlive = g_cs2Cr3 && g_clientBase && ReadCs2Memory(g_clientBase, &mz, sizeof(mz)) && mz == 0x5A4D;
@@ -442,71 +386,50 @@ static void Tick() {
     ULONG64 lp = 0, es = 0;
     RdQ(g_clientBase + OFF_dwLocalPlayerPawn, &lp);
     RdQ(g_clientBase + OFF_dwEntityList, &es);
-    g_localPawn = lp;
-    g_entitySystem = es;
+    g_localPawn = lp; g_entitySystem = es;
 
     float vm[16] = {};
     ReadCs2Memory(g_clientBase + OFF_dwViewMatrix, vm, sizeof(vm));
     if (g_viewVa) RtlCopyMemory(g_viewVa, vm, sizeof(vm));
 
-    if (logNow) Log("base=%llx cr3=%llx lp=%llx es=%llx vm[0]=%.3f vm[12]=%.3f",
-                    g_clientBase, g_cs2Cr3, lp, es, vm[0], vm[12]);
+    if (logNow) Log("base=%llx cr3=%llx lp=%llx es=%llx vm[0]=%.3f vm[12]=%.3f", g_clientBase, g_cs2Cr3, lp, es, vm[0], vm[12]);
 
     if (!lp || !es) { ClearShared(); return; }
-
-    ULONG myTeam = 0;
-    RdD(lp + OFF_m_iTeamNum, &myTeam);
+    ULONG myTeam = 0; RdD(lp + OFF_m_iTeamNum, &myTeam);
 
     if (g_sharedVa) InterlockedIncrement(&g_sharedVa->hdr.seq);
-    ULONG out = 0;
-    ULONG scanned = 0, ctrlOk = 0, pawnOk = 0, aliveOk = 0, boneOk = 0;
+    ULONG out = 0; ULONG scanned = 0, ctrlOk = 0, pawnOk = 0, aliveOk = 0, boneOk = 0;
 
     for (ULONG i = 1; i <= 64 && out < MAX_ENTITIES; ++i) {
         ++scanned;
         ULONG64 ctrl = EntityByIndex(es, i);
-        if (!ctrl) continue;
-        ++ctrlOk;
-        ULONG hPawn = 0;
-        if (!RdD(ctrl + OFF_m_hPlayerPawn, &hPawn)) continue;
+        if (!ctrl) continue; ++ctrlOk;
+        ULONG hPawn = 0; if (!RdD(ctrl + OFF_m_hPlayerPawn, &hPawn)) continue;
         if (!hPawn || hPawn == 0xFFFFFFFF) continue;
         ULONG64 pawn = EntityByIndex(es, hPawn & 0x7FFF);
-        if (!pawn || pawn == lp) continue;
-        ++pawnOk;
+        if (!pawn || pawn == lp) continue; ++pawnOk;
 
         ULONG hp = 0, ls = 0, team = 0;
-        RdD(pawn + OFF_m_iHealth, &hp);
-        RdD(pawn + OFF_m_lifeState, &ls);
-        RdD(pawn + OFF_m_iTeamNum, &team);
-        if ((int)hp <= 0 || (int)hp > 200 || ls != 256 || team == myTeam) continue;
-        ++aliveOk;
+        RdD(pawn + OFF_m_iHealth, &hp); RdD(pawn + OFF_m_lifeState, &ls); RdD(pawn + OFF_m_iTeamNum, &team);
+        if ((int)hp <= 0 || (int)hp > 200 || ls != 256 || team == myTeam) continue; ++aliveOk;
 
         ULONG64 scene = 0, bMat = 0;
         if (!RdQ(pawn + OFF_m_pGameSceneNode, &scene) || !scene) continue;
         if (!RdQ(scene + OFF_m_modelState + 0x80, &bMat) || !bMat) continue;
 
         UCHAR raw[MAX_BONES * 0x20];
-        if (!ReadCs2Memory(bMat, raw, sizeof(raw))) continue;
-        ++boneOk;
+        if (!ReadCs2Memory(bMat, raw, sizeof(raw))) continue; ++boneOk;
 
-        SHARED_ENTITY e = {};
-        e.valid = 1; e.hp = (int)hp; e.team = (int)team;
-        for (int b = 0; b < MAX_BONES; ++b)
-            RtlCopyMemory(&e.bones[b], raw + (size_t)b * 0x20, sizeof(SHARED_BONE));
+        SHARED_ENTITY e = {}; e.valid = 1; e.hp = (int)hp; e.team = (int)team;
+        for (int b = 0; b < MAX_BONES; ++b) RtlCopyMemory(&e.bones[b], raw + (size_t)b * 0x20, sizeof(SHARED_BONE));
 
-        if (g_sharedVa) g_sharedVa->ents[out] = e;
-        ++out;
+        if (g_sharedVa) g_sharedVa->ents[out] = e; ++out;
     }
     if (g_sharedVa) {
-        g_sharedVa->hdr.entityCount = out;
-        g_sharedVa->hdr.version = 1;
+        g_sharedVa->hdr.entityCount = out; g_sharedVa->hdr.version = 1;
         InterlockedIncrement(&g_sharedVa->hdr.seq);
     }
-
-    if (logNow) {
-        Log("scan: scanned=%u ctrlOk=%u pawnOk=%u aliveOk=%u boneOk=%u out=%u reads=%ld fails=%ld",
-            scanned, ctrlOk, pawnOk, aliveOk, boneOk, out,
-            (long)g_statReads, (long)g_statReadFails);
-    }
+    if (logNow) Log("scan: scanned=%u ctrlOk=%u pawnOk=%u aliveOk=%u boneOk=%u out=%u reads=%ld fails=%ld", scanned, ctrlOk, pawnOk, aliveOk, boneOk, out, (long)g_statReads, (long)g_statReadFails);
 }
 
 static VOID WorkerThread(PVOID) {
@@ -519,47 +442,15 @@ static VOID WorkerThread(PVOID) {
     }
 }
 
-// Self-relative SD с DACL = 1 ACE (Everyone: GENERIC_ALL).
-// Null-DACL в kernel-mode ZwCreateSection иногда даёт AV внутри SeAssignSecurity → BSOD 0x1E.
-static NTSTATUS BuildEveryoneSd(PISECURITY_DESCRIPTOR sd, PVOID* outAcl) {
-    PUCHAR p = (PUCHAR)sd;
-    RtlZeroMemory(p, 0x50);
-
-    PACL acl = (PACL)(p + sizeof(SECURITY_DESCRIPTOR));
-    PISID sid = (PISID)((PUCHAR)acl + 0x10 + 0x0C);
-
-    sid->Revision = 1;
-    sid->SubAuthorityCount = 1;
-    sid->IdentifierAuthority.Value[0] = 0;
-    sid->IdentifierAuthority.Value[1] = 0;
-    sid->IdentifierAuthority.Value[2] = 0;
-    sid->IdentifierAuthority.Value[3] = 0;
-    sid->IdentifierAuthority.Value[4] = 0;
-    sid->IdentifierAuthority.Value[5] = 1;
-    sid->SubAuthority[0] = 0;
-
-    acl->AclRevision = ACL_REVISION;
-    acl->Sbz1 = 0;
-    acl->AclSize = 0x10 + 0x0C + 8;
-    acl->AceCount = 1;
-    acl->Sbz2 = 0;
-
-    PACCESS_ALLOWED_ACE ace = (PACCESS_ALLOWED_ACE)((PUCHAR)acl + 0x10);
-    ace->Header.AceType  = ACCESS_ALLOWED_ACE_TYPE;
-    ace->Header.AceFlags = 0;
-    ace->Header.AceSize  = 0x0C + 8;
-    ace->Mask            = 0xFFFFFFFF;
-
-    sd->Revision = SECURITY_DESCRIPTOR_REVISION;
-    sd->Sbz1 = 0;
-    sd->Control = (USHORT)(SE_SELF_RELATIVE | SE_DACL_PRESENT);
-    sd->Owner = nullptr;
-    sd->Group = nullptr;
-    sd->Sacl  = nullptr;
-    sd->Dacl  = acl;
-
-    if (outAcl) *outAcl = acl;
-    return STATUS_SUCCESS;
+// ---------------------------------------------------------------------------
+// Безопасное создание Security Descriptor для Windows 11 24H2+
+// Используем стандартный API, чтобы избежать BSOD в SeAssignSecurity.
+// ---------------------------------------------------------------------------
+static NTSTATUS BuildSafeSd(PSECURITY_DESCRIPTOR sd) {
+    NTSTATUS st = RtlCreateSecurityDescriptor(sd, SECURITY_DESCRIPTOR_REVISION);
+    if (!NT_SUCCESS(st)) return st;
+    // Устанавливаем Null DACL (доступ всем), но через официальную функцию
+    return RtlSetDaclSecurityDescriptor(sd, TRUE, NULL, FALSE);
 }
 
 static NTSTATUS OpenOrCreateSection(PCWSTR nameStr, HANDLE* outHandle, LARGE_INTEGER size) {
@@ -567,18 +458,14 @@ static NTSTATUS OpenOrCreateSection(PCWSTR nameStr, HANDLE* outHandle, LARGE_INT
     UNICODE_STRING name;
     OBJECT_ATTRIBUTES oa;
 
-    UCHAR sdBuf[0x80];
-    PSECURITY_DESCRIPTOR sd = (PSECURITY_DESCRIPTOR)sdBuf;
-    PVOID aclUnused = nullptr;
-    st = BuildEveryoneSd((PISECURITY_DESCRIPTOR)sd, &aclUnused);
+    SECURITY_DESCRIPTOR sd;
+    st = BuildSafeSd(&sd);
     if (!NT_SUCCESS(st)) return st;
 
     RtlInitUnicodeString(&name, nameStr);
-    InitializeObjectAttributes(&oa, &name, OBJ_CASE_INSENSITIVE | OBJ_KERNEL_HANDLE, nullptr, sd);
+    InitializeObjectAttributes(&oa, &name, OBJ_CASE_INSENSITIVE | OBJ_KERNEL_HANDLE, nullptr, &sd);
 
-    DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL, "[esp_drv] OpenOrCreateSection(%ws) before ZwCreateSection\n", nameStr);
     st = ZwCreateSection(outHandle, SECTION_ALL_ACCESS, &oa, &size, PAGE_READWRITE, SEC_COMMIT, nullptr);
-    DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL, "[esp_drv] OpenOrCreateSection(%ws) ZwCreateSection st=%08x\n", nameStr, st);
 
     if (st == STATUS_OBJECT_NAME_COLLISION) {
         Log("section exists, opening instead");
@@ -595,7 +482,6 @@ static NTSTATUS CreateShared() {
     SIZE_T vs = 0;
     SECTION_BASIC_INFORMATION sbi = {};
 
-    // ---------- shared ----------
     if (!g_sharedVa) {
         sz.QuadPart = sizeof(SHARED_BLOCK);
         st = OpenOrCreateSection(L"\\BaseNamedObjects\\Cs2EspShared_v1", &g_hSharedSection, sz);
@@ -604,9 +490,6 @@ static NTSTATUS CreateShared() {
         RtlZeroMemory(&sbi, sizeof(sbi));
         st = ZwQuerySection(g_hSharedSection, SectionBasicInformation, &sbi, sizeof(sbi), nullptr);
         if (NT_SUCCESS(st)) {
-            Log("shared: Size=%llx need=%llx",
-                (unsigned long long)sbi.Size.QuadPart,
-                (unsigned long long)sizeof(SHARED_BLOCK));
             if (sbi.Size.QuadPart < (ULONGLONG)sizeof(SHARED_BLOCK)) {
                 Log("shared: too small, stale section. Reboot required.");
                 ZwClose(g_hSharedSection); g_hSharedSection = nullptr;
@@ -615,9 +498,7 @@ static NTSTATUS CreateShared() {
         }
 
         base = nullptr; vs = 0;
-        DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL, "[esp_drv] shared before MapView\n");
         st = ZwMapViewOfSection(g_hSharedSection, ZwCurrentProcess(), &base, 0, 0, nullptr, &vs, ViewUnmap, 0, PAGE_READWRITE);
-        DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL, "[esp_drv] shared after MapView st=%08x base=%p\n", st, base);
         if (!NT_SUCCESS(st)) { Log("MapView shared failed %x", (unsigned)st); return st; }
 
         g_sharedVa = (SHARED_BLOCK*)base;
@@ -625,7 +506,6 @@ static NTSTATUS CreateShared() {
         g_sharedVa->hdr.maxEntities = MAX_ENTITIES;
     }
 
-    // ---------- view ----------
     if (!g_viewVa) {
         sz.QuadPart = 0x1000;
         st = OpenOrCreateSection(L"\\BaseNamedObjects\\Cs2EspView_v1", &g_hViewSection, sz);
@@ -634,8 +514,6 @@ static NTSTATUS CreateShared() {
         RtlZeroMemory(&sbi, sizeof(sbi));
         st = ZwQuerySection(g_hViewSection, SectionBasicInformation, &sbi, sizeof(sbi), nullptr);
         if (NT_SUCCESS(st)) {
-            Log("view: Size=%llx need>=40",
-                (unsigned long long)sbi.Size.QuadPart);
             if (sbi.Size.QuadPart < 64ULL) {
                 Log("view: too small, stale section. Reboot required.");
                 ZwClose(g_hViewSection); g_hViewSection = nullptr;
@@ -644,9 +522,7 @@ static NTSTATUS CreateShared() {
         }
 
         base = nullptr; vs = 0;
-        DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL, "[esp_drv] view before MapView\n");
         st = ZwMapViewOfSection(g_hViewSection, ZwCurrentProcess(), &base, 0, 0, nullptr, &vs, ViewUnmap, 0, PAGE_READWRITE);
-        DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL, "[esp_drv] view after MapView st=%08x base=%p\n", st, base);
         if (!NT_SUCCESS(st)) { Log("MapView view failed %x", (unsigned)st); return st; }
 
         g_viewVa = (float*)base;
@@ -662,7 +538,6 @@ static void DestroyShared() {
     if (g_hSharedSection)             { ZwClose(g_hSharedSection); g_hSharedSection = nullptr; }
 }
 
-// ---- DriverEntry ----
 extern "C" NTSTATUS DriverEntry(PDRIVER_OBJECT drv, PUNICODE_STRING) {
     NTSTATUS st = CreateShared();
     if (!NT_SUCCESS(st)) return st;
