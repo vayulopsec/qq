@@ -7,6 +7,8 @@
 //   * No SEH                  — no __try/__except/__finally.
 //   * No STL / C++ runtime    — only <ntifs.h>, <ntddk.h>, <intrin.h>.
 //   * No implicit new/delete  — all memory via ExAllocatePool2 / ExFreePoolWithTag.
+//   * No FP math in kernel    — no float/double arithmetic, only byte copies.
+//   * Mapper-safe globals     — all state reset explicitly in DriverEntry.
 
 #include <ntifs.h>
 #include <ntddk.h>
@@ -111,7 +113,8 @@ static volatile LONG   g_statReads = 0;
 static volatile LONG   g_statReadFails = 0;
 
 // ---------------------------------------------------------------------------
-// Мини-форматтер для kernel-mode: без UCRT, без ntstrsafe-vprintf.
+// Мини-форматтер для kernel-mode: без UCRT, без FP.
+// Поддерживается: %X %x %u %d %i %p %s %c %% и префикс 'l' / 'll'.
 // ---------------------------------------------------------------------------
 static char* KAppendChar(char* p, char* end, char c) {
     if (p < end) *p++ = c;
@@ -135,26 +138,11 @@ static char* KAppendUInt(char* p, char* end, unsigned long long v, unsigned base
 }
 
 static char* KAppendInt(char* p, char* end, long long v) {
-    if (v < 0) { p = KAppendChar(p, end, '-'); return KAppendUInt(p, end, (unsigned long long)(-v), 10, false); }
-    return KAppendUInt(p, end, (unsigned long long)v, 10, false);
-}
-
-static char* KAppendFloat(char* p, char* end, double v, int prec) {
-    if (v != v) return KAppendStr(p, end, "nan");
-    if (v < 0) { p = KAppendChar(p, end, '-'); v = -v; }
-    unsigned long long ip = (unsigned long long)v;
-    double frac = v - (double)ip;
-    p = KAppendUInt(p, end, ip, 10, false);
-    if (prec > 0) {
-        p = KAppendChar(p, end, '.');
-        for (int i = 0; i < prec; ++i) {
-            frac *= 10.0;
-            int d = (int)frac;
-            p = KAppendChar(p, end, (char)('0' + d));
-            frac -= d;
-        }
+    if (v < 0) {
+        p = KAppendChar(p, end, '-');
+        return KAppendUInt(p, end, (unsigned long long)(-v), 10, false);
     }
-    return p;
+    return KAppendUInt(p, end, (unsigned long long)v, 10, false);
 }
 
 static void KVPrintf(char* out, SIZE_T outCap, const char* fmt, va_list ap) {
@@ -189,7 +177,7 @@ static void KVPrintf(char* out, SIZE_T outCap, const char* fmt, va_list ap) {
             continue; }
         if (*fmt == 's') { ++fmt; p = KAppendStr(p, end, va_arg(ap, const char*)); continue; }
         if (*fmt == 'c') { ++fmt; p = KAppendChar(p, end, (char)va_arg(ap, int)); continue; }
-        if (*fmt == 'f') { ++fmt; p = KAppendFloat(p, end, va_arg(ap, double), 3); continue; }
+        // неизвестный спецификатор: печатаем как есть, аргументы не трогаем
         p = KAppendChar(p, end, '%');
         if (*fmt) p = KAppendChar(p, end, *fmt++);
     }
@@ -199,8 +187,8 @@ static void KVPrintf(char* out, SIZE_T outCap, const char* fmt, va_list ap) {
 static void LogRaw(const char* text) {
     DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL, "[esp_drv] %s\n", text);
     if (!g_sharedVa) return;
-    LONG tail = InterlockedIncrement(&g_sharedVa->log.tail) - 1;
-    LONG slot = tail % MAX_LOGS;
+    ULONG tail = (ULONG)InterlockedIncrement(&g_sharedVa->log.tail) - 1;
+    ULONG slot = tail % MAX_LOGS;
     g_sharedVa->log.entries[slot].tick = (ULONG)InterlockedIncrement(&g_logTick);
     char* dst = g_sharedVa->log.entries[slot].text;
     const char* src = text;
@@ -218,7 +206,7 @@ static void Log(const char* fmt, ...) {
     LogRaw(buf);
 }
 
-// ---- CR3 page walker ----
+// ---- physical read + CR3 page walker ----
 static BOOLEAN ReadPhysical(ULONG64 phys, PVOID buf, SIZE_T size) {
     PHYSICAL_ADDRESS pa;
     pa.QuadPart = phys;
@@ -326,22 +314,41 @@ typedef struct _LDR_ENTRY_OFF {
 } LDR_ENTRY_OFF;
 
 static ULONG64 FindModuleBase(PEPROCESS proc, PCWSTR moduleName) {
-    ULONG64 peb = 0; UNICODE_STRING fnName; RtlInitUnicodeString(&fnName, L"PsGetProcessPeb");
-    typedef PVOID(*fnPeb)(PEPROCESS); fnPeb fn = (fnPeb)MmGetSystemRoutineAddress(&fnName);
-    if (fn) peb = (ULONG64)fn(proc); if (!peb) return 0;
-    ULONG64 ldr = 0; if (!RdQ(peb + 0x18, &ldr) || !ldr) return 0;
-    ULONG64 head = ldr + 0x10; ULONG64 cur = 0; if (!RdQ(head, &cur)) return 0;
+    ULONG64 peb = 0;
+    UNICODE_STRING fnName;
+    RtlInitUnicodeString(&fnName, L"PsGetProcessPeb");
+    typedef PVOID(*fnPeb)(PEPROCESS);
+    fnPeb fn = (fnPeb)MmGetSystemRoutineAddress(&fnName);
+    if (!fn) return 0;
+    peb = (ULONG64)fn(proc);
+    if (!peb) return 0;
+
+    UNICODE_STRING want;
+    RtlInitUnicodeString(&want, moduleName);
+
+    ULONG64 ldr = 0;
+    if (!RdQ(peb + 0x18, &ldr) || !ldr) return 0;
+    ULONG64 head = ldr + 0x10;
+    ULONG64 cur = 0;
+    if (!RdQ(head, &cur)) return 0;
+
     for (int guard = 0; guard < 512 && cur && cur != head; ++guard) {
-        LDR_ENTRY_OFF e = {}; if (!ReadCs2Memory(cur, &e, sizeof(e))) return 0;
+        LDR_ENTRY_OFF e = {};
+        if (!ReadCs2Memory(cur, &e, sizeof(e))) return 0;
         if (e.BaseDllName.Buffer && e.BaseDllName.Length) {
-            WCHAR n[128] = {}; USHORT len = e.BaseDllName.Length;
+            WCHAR n[128] = {};
+            USHORT len = e.BaseDllName.Length;
             if (len > sizeof(n) - sizeof(WCHAR)) len = sizeof(n) - sizeof(WCHAR);
             if (ReadCs2Memory((ULONG64)e.BaseDllName.Buffer, n, len)) {
                 n[len / sizeof(WCHAR)] = 0;
-                if (_wcsicmp(n, moduleName) == 0) return (ULONG64)e.DllBase;
+                UNICODE_STRING un;
+                RtlInitUnicodeString(&un, n);
+                if (RtlEqualUnicodeString(&un, &want, TRUE)) return (ULONG64)e.DllBase;
             }
         }
-        ULONG64 next = 0; if (!RdQ(cur, &next)) return 0; cur = next;
+        ULONG64 next = 0;
+        if (!RdQ(cur, &next)) return 0;
+        cur = next;
     }
     return 0;
 }
@@ -349,12 +356,17 @@ static ULONG64 FindModuleBase(PEPROCESS proc, PCWSTR moduleName) {
 // ---- GetEntityByIndex ----
 static ULONG64 EntityByIndex(ULONG64 es, ULONG idx) {
     if (!es || idx > 0x7FFE) return 0;
-    ULONG c = idx >> 9; if (c > 0x3F) return 0;
-    ULONG64 chunk = 0; if (!RdQ(es + 0x10 + 8ULL * c, &chunk) || !chunk) return 0;
+    ULONG c = idx >> 9;
+    if (c > 0x3F) return 0;
+    ULONG64 chunk = 0;
+    if (!RdQ(es + 0x10 + 8ULL * c, &chunk) || !chunk) return 0;
     ULONG64 entry = chunk + 112ULL * (idx & 0x1FF);
-    ULONG ident = 0; if (!RdD(entry + 0x10, &ident)) return 0;
+    ULONG ident = 0;
+    if (!RdD(entry + 0x10, &ident)) return 0;
     if ((ident & 0x7FFF) != idx) return 0;
-    ULONG64 ent = 0; if (!RdQ(entry, &ent)) return 0; return ent;
+    ULONG64 ent = 0;
+    if (!RdQ(entry, &ent)) return 0;
+    return ent;
 }
 
 static void ClearShared() {
@@ -367,7 +379,8 @@ static void ClearShared() {
 static void Tick() {
     static ULONG s_lastLog = 0;
     ULONG now = (ULONG)InterlockedIncrement(&g_logTick) / 100;
-    bool logNow = (now != s_lastLog); if (logNow) s_lastLog = now;
+    bool logNow = (now != s_lastLog);
+    if (logNow) s_lastLog = now;
 
     USHORT mz = 0;
     bool baseAlive = g_cs2Cr3 && g_clientBase && ReadCs2Memory(g_clientBase, &mz, sizeof(mz)) && mz == 0x5A4D;
@@ -388,48 +401,73 @@ static void Tick() {
     RdQ(g_clientBase + OFF_dwEntityList, &es);
     g_localPawn = lp; g_entitySystem = es;
 
+    // view matrix: только побайтовое копирование, без FP-арифметики
     float vm[16] = {};
     ReadCs2Memory(g_clientBase + OFF_dwViewMatrix, vm, sizeof(vm));
     if (g_viewVa) RtlCopyMemory(g_viewVa, vm, sizeof(vm));
 
-    if (logNow) Log("base=%llx cr3=%llx lp=%llx es=%llx vm[0]=%.3f vm[12]=%.3f", g_clientBase, g_cs2Cr3, lp, es, vm[0], vm[12]);
+    if (logNow) {
+        Log("base=%llx cr3=%llx lp=%llx es=%llx vm0=%x vm12=%x",
+            g_clientBase, g_cs2Cr3, lp, es, *(ULONG*)&vm[0], *(ULONG*)&vm[12]);
+    }
 
     if (!lp || !es) { ClearShared(); return; }
-    ULONG myTeam = 0; RdD(lp + OFF_m_iTeamNum, &myTeam);
+    ULONG myTeam = 0;
+    RdD(lp + OFF_m_iTeamNum, &myTeam);
 
     if (g_sharedVa) InterlockedIncrement(&g_sharedVa->hdr.seq);
-    ULONG out = 0; ULONG scanned = 0, ctrlOk = 0, pawnOk = 0, aliveOk = 0, boneOk = 0;
+    ULONG out = 0, scanned = 0, ctrlOk = 0, pawnOk = 0, aliveOk = 0, boneOk = 0;
 
     for (ULONG i = 1; i <= 64 && out < MAX_ENTITIES; ++i) {
         ++scanned;
         ULONG64 ctrl = EntityByIndex(es, i);
-        if (!ctrl) continue; ++ctrlOk;
-        ULONG hPawn = 0; if (!RdD(ctrl + OFF_m_hPlayerPawn, &hPawn)) continue;
+        if (!ctrl) continue;
+        ++ctrlOk;
+
+        ULONG hPawn = 0;
+        if (!RdD(ctrl + OFF_m_hPlayerPawn, &hPawn)) continue;
         if (!hPawn || hPawn == 0xFFFFFFFF) continue;
+
         ULONG64 pawn = EntityByIndex(es, hPawn & 0x7FFF);
-        if (!pawn || pawn == lp) continue; ++pawnOk;
+        if (!pawn || pawn == lp) continue;
+        ++pawnOk;
 
         ULONG hp = 0, ls = 0, team = 0;
-        RdD(pawn + OFF_m_iHealth, &hp); RdD(pawn + OFF_m_lifeState, &ls); RdD(pawn + OFF_m_iTeamNum, &team);
-        if ((int)hp <= 0 || (int)hp > 200 || ls != 256 || team == myTeam) continue; ++aliveOk;
+        RdD(pawn + OFF_m_iHealth, &hp);
+        RdD(pawn + OFF_m_lifeState, &ls);
+        RdD(pawn + OFF_m_iTeamNum, &team);
+        if ((int)hp <= 0 || (int)hp > 200 || ls != 256 || team == myTeam) continue;
+        ++aliveOk;
 
         ULONG64 scene = 0, bMat = 0;
         if (!RdQ(pawn + OFF_m_pGameSceneNode, &scene) || !scene) continue;
         if (!RdQ(scene + OFF_m_modelState + 0x80, &bMat) || !bMat) continue;
 
         UCHAR raw[MAX_BONES * 0x20];
-        if (!ReadCs2Memory(bMat, raw, sizeof(raw))) continue; ++boneOk;
+        if (!ReadCs2Memory(bMat, raw, sizeof(raw))) continue;
+        ++boneOk;
 
-        SHARED_ENTITY e = {}; e.valid = 1; e.hp = (int)hp; e.team = (int)team;
-        for (int b = 0; b < MAX_BONES; ++b) RtlCopyMemory(&e.bones[b], raw + (size_t)b * 0x20, sizeof(SHARED_BONE));
+        SHARED_ENTITY e = {};
+        e.valid = 1; e.hp = (int)hp; e.team = (int)team;
+        for (int b = 0; b < MAX_BONES; ++b) {
+            RtlCopyMemory(&e.bones[b], raw + (size_t)b * 0x20, sizeof(SHARED_BONE));
+        }
 
-        if (g_sharedVa) g_sharedVa->ents[out] = e; ++out;
+        if (g_sharedVa) g_sharedVa->ents[out] = e;
+        ++out;
     }
+
     if (g_sharedVa) {
-        g_sharedVa->hdr.entityCount = out; g_sharedVa->hdr.version = 1;
+        g_sharedVa->hdr.entityCount = out;
+        g_sharedVa->hdr.version = 1;
         InterlockedIncrement(&g_sharedVa->hdr.seq);
     }
-    if (logNow) Log("scan: scanned=%u ctrlOk=%u pawnOk=%u aliveOk=%u boneOk=%u out=%u reads=%ld fails=%ld", scanned, ctrlOk, pawnOk, aliveOk, boneOk, out, (long)g_statReads, (long)g_statReadFails);
+
+    if (logNow) {
+        Log("scan: scanned=%u ctrlOk=%u pawnOk=%u aliveOk=%u boneOk=%u out=%u reads=%u fails=%u",
+            scanned, ctrlOk, pawnOk, aliveOk, boneOk, out,
+            (ULONG)g_statReads, (ULONG)g_statReadFails);
+    }
 }
 
 static VOID WorkerThread(PVOID) {
@@ -443,13 +481,11 @@ static VOID WorkerThread(PVOID) {
 }
 
 // ---------------------------------------------------------------------------
-// Безопасное создание Security Descriptor для Windows 11 24H2+
-// Используем стандартный API, чтобы избежать BSOD в SeAssignSecurity.
+// Безопасное создание Security Descriptor: стандартный API, NULL DACL.
 // ---------------------------------------------------------------------------
 static NTSTATUS BuildSafeSd(PSECURITY_DESCRIPTOR sd) {
     NTSTATUS st = RtlCreateSecurityDescriptor(sd, SECURITY_DESCRIPTOR_REVISION);
     if (!NT_SUCCESS(st)) return st;
-    // Устанавливаем Null DACL (доступ всем), но через официальную функцию
     return RtlSetDaclSecurityDescriptor(sd, TRUE, NULL, FALSE);
 }
 
@@ -532,13 +568,32 @@ static NTSTATUS CreateShared() {
 }
 
 static void DestroyShared() {
-    if (g_viewVa && g_hViewSection)   { ZwUnmapViewOfSection(ZwCurrentProcess(), g_viewVa); g_viewVa = nullptr; }
-    if (g_hViewSection)               { ZwClose(g_hViewSection); g_hViewSection = nullptr; }
+    if (g_viewVa && g_hViewSection)    { ZwUnmapViewOfSection(ZwCurrentProcess(), g_viewVa); g_viewVa = nullptr; }
+    if (g_hViewSection)                { ZwClose(g_hViewSection); g_hViewSection = nullptr; }
     if (g_sharedVa && g_hSharedSection){ ZwUnmapViewOfSection(ZwCurrentProcess(), g_sharedVa); g_sharedVa = nullptr; }
-    if (g_hSharedSection)             { ZwClose(g_hSharedSection); g_hSharedSection = nullptr; }
+    if (g_hSharedSection)              { ZwClose(g_hSharedSection); g_hSharedSection = nullptr; }
+}
+
+// Именованная функция вместо лямбды: без неявного преобразования и захвата.
+static VOID DriverUnloadFn(PDRIVER_OBJECT) {
+    InterlockedExchange(&g_stop, 1);
+    KeSetEvent(&g_workerEvent, 0, FALSE);
+    if (g_workerThread) {
+        KeWaitForSingleObject(g_workerThread, Executive, KernelMode, FALSE, nullptr);
+        ObDereferenceObject(g_workerThread);
+        g_workerThread = nullptr;
+    }
+    DestroyShared();
 }
 
 extern "C" NTSTATUS DriverEntry(PDRIVER_OBJECT drv, PUNICODE_STRING) {
+    // маппер может не обнулить .data/.bss, поэтому сбрасываем явно
+    g_hSharedSection = nullptr; g_sharedVa = nullptr;
+    g_hViewSection   = nullptr; g_viewVa   = nullptr;
+    g_cs2Cr3 = 0; g_clientBase = 0; g_localPawn = 0; g_entitySystem = 0;
+    g_stop = 0; g_workerThread = nullptr;
+    g_logTick = 0; g_statReads = 0; g_statReadFails = 0;
+
     NTSTATUS st = CreateShared();
     if (!NT_SUCCESS(st)) return st;
 
@@ -552,15 +607,7 @@ extern "C" NTSTATUS DriverEntry(PDRIVER_OBJECT drv, PUNICODE_STRING) {
 
     Log("DriverEntry ok: shared=%p view=%p", g_sharedVa, g_viewVa);
 
-    drv->DriverUnload = [](PDRIVER_OBJECT) {
-        InterlockedExchange(&g_stop, 1);
-        KeSetEvent(&g_workerEvent, 0, FALSE);
-        if (g_workerThread) {
-            KeWaitForSingleObject(g_workerThread, Executive, KernelMode, FALSE, nullptr);
-            ObDereferenceObject(g_workerThread);
-            g_workerThread = nullptr;
-        }
-        DestroyShared();
-    };
+    // маппер часто передаёт NULL вместо DRIVER_OBJECT
+    if (drv) drv->DriverUnload = DriverUnloadFn;
     return STATUS_SUCCESS;
 }
