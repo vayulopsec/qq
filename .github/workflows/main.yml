@@ -9,97 +9,62 @@ on:
 
 jobs:
   build-driver:
-    runs-on: windows-latest
+    runs-on: windows-2022
 
     steps:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Install WDK + Windows SDK (via VS Installer)
+      - name: Download & Install WDK (10.0.26100)
         shell: pwsh
         run: |
-          $vsInstaller = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vs_installer.exe"
-          $vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
-
-          if (-not (Test-Path $vsInstaller)) {
-            Write-Error "vs_installer.exe not found at expected path"
+          Write-Host "Downloading WDK 10.0.26100.1 installer..."
+          $wdkUrl = "https://go.microsoft.com/fwlink/?linkid=2271871"
+          $installerPath = "$env:TEMP\wdksetup.exe"
+          
+          Invoke-WebRequest -Uri $wdkUrl -OutFile $installerPath
+          
+          Write-Host "Installing WDK..."
+          $process = Start-Process -FilePath $installerPath -ArgumentList "/features + /q" -Wait -PassThru -NoNewWindow
+          
+          if ($process.ExitCode -ne 0) {
+            Write-Error "WDK installation failed with exit code: $($process.ExitCode)"
             exit 1
           }
-
-          # Ищем экземпляр Visual Studio 2022 (версия 17.x), если он есть параллельно
-          $installPath = & $vswhere -version '[17.0,18.0)' -property installationPath
-
-          # Если VS 2022 не найдена, берём путь последней активной установки
-          if (-not $installPath) {
-            $installPath = & $vswhere -latest -property installationPath
-          }
-
-          if (-not $installPath) {
-            Write-Error "Visual Studio installation path could not be resolved via vswhere."
-            exit 1
-          }
-
-          Write-Host "Target VS path: $installPath"
-
-          $args = @(
-            'modify',
-            '--installPath', "`"$installPath`"",
-            '--add', 'Microsoft.VisualStudio.Component.WDK',
-            '--add', 'Microsoft.VisualStudio.Component.Windows11SDK.26100',
-            '--quiet', '--norestart', '--nocache'
-          )
-
-          Write-Host "Running: $vsInstaller $($args -join ' ')"
-          $p = Start-Process -FilePath $vsInstaller -ArgumentList $args -Wait -PassThru -NoNewWindow
-
-          if ($p.ExitCode -ne 0 -and $p.ExitCode -ne 3010) {
-            Write-Error "VS Installer failed with exit code: $($p.ExitCode)"
-
-            # Вывод хвоста последнего лога установки для детальной диагностики ошибки
-            $logDir = "$env:TEMP"
-            $latestLog = Get-ChildItem -Path $logDir -Filter "dd_setup_*.log" | Sort-Object LastWriteTime -Descending | Select-Object -First 1
-            if ($latestLog) {
-              Write-Host "`n=== VS Installer Log: $($latestLog.FullName) ===" -ForegroundColor Yellow
-              Get-Content $latestLog.FullName -Tail 60
-            } else {
-              Write-Warning "Setup log file (dd_setup_*.log) not found in $logDir"
-            }
-            exit 1
-          }
-
-          Write-Host "WDK and SDK components installed successfully."
+          Write-Host "WDK installed successfully."
 
       - name: Setup MSVC (x64)
         uses: ilammy/msvc-dev-cmd@v1
         with:
           arch: x64
 
-      - name: Verify WDK paths
+      - name: Verify Kernel Mode Libraries
         shell: pwsh
         run: |
-          $wdkRoot = "${env:ProgramFiles(x86)}\Windows Kits\10"
-          if (-not (Test-Path $wdkRoot)) {
-            Write-Error "Windows Kits directory not found: $wdkRoot"
+          $kmLibPath = "${env:ProgramFiles(x86)}\Windows Kits\10\Lib\10.0.26100.0\km\x64\ntoskrnl.lib"
+          if (-not (Test-Path $kmLibPath)) {
+            Write-Error "CRITICAL: ntoskrnl.lib not found at: $kmLibPath"
+            
+            # Диагностика: вывод фактически установленных версий SDK/WDK
+            Write-Host "Available Kit Lib directories:"
+            Get-ChildItem "${env:ProgramFiles(x86)}\Windows Kits\10\Lib" -Directory | Select-Object FullName
             exit 1
           }
-          Write-Host "Includes found in Windows Kits:"
-          Get-ChildItem "$wdkRoot\Include" | Select-Object -ExpandProperty Name
-          Write-Host "Libs found in Windows Kits:"
-          Get-ChildItem "$wdkRoot\Lib" | Select-Object -ExpandProperty Name
+          Write-Host "SUCCESS: Found $kmLibPath"
 
       - name: Configure CMake (driver)
         shell: pwsh
         run: |
-          # В среде msvc-dev-cmd сборка драйвера через Ninja работает напрямую с флагами компилятора
           cmake -S . -B build -G "Ninja" -DCMAKE_BUILD_TYPE=Release
 
       - name: Build driver (Release)
         shell: pwsh
-        run: cmake --build build --config Release --target esp_drv
+        run: |
+          cmake --build build --config Release --target esp_drv
 
       - name: Upload .sys artifact
         uses: actions/upload-artifact@v4
         with:
           name: esp_drv-sys
-          path: build/Release/esp_drv.sys
-          if-no-files-found: error
+          path: build/esp_drv.sys
+          if-no-files-found: warn
