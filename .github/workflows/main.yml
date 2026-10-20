@@ -20,18 +20,50 @@ jobs:
         with:
           arch: x64
 
-      - name: Setup WDK
-        uses: eb/setup-wdk@v1
-
-      - name: Verify WDK files
+      - name: Install WDK via NuGet
         shell: pwsh
         run: |
-          $foundLib = Get-ChildItem -Path "${env:ProgramFiles(x86)}\Windows Kits\10" -Filter "ntoskrnl.lib" -Recurse -ErrorAction SilentlyContinue | Select-Object -First 1
-          if (-not $foundLib) {
-            Write-Error "ntoskrnl.lib still not found in Windows Kits directory."
+          Write-Host "Installing Microsoft.Windows.WDK.x64 via nuget..."
+          $outDir = "$env:TEMP\wdk_nuget"
+          
+          # Устанавливаем пакет без привязки к имени папки
+          nuget install Microsoft.Windows.WDK.x64 -Version 10.0.26100.2454 -OutputDirectory $outDir
+
+          # Ищем ntoskrnl.lib рекурсивно внутри скачанного пакета
+          $libFile = Get-ChildItem -Path $outDir -Filter "ntoskrnl.lib" -Recurse | Where-Object { $_.FullName -match "x64" } | Select-Object -First 1
+          if (-not $libFile) {
+            Write-Error "ntoskrnl.lib not found in NuGet package"
             exit 1
           }
-          Write-Host "Found ntoskrnl.lib at: $($foundLib.FullName)"
+          $sourceKmLib = $libFile.DirectoryName
+          Write-Host "Found WDK Libs at: $sourceKmLib"
+
+          # Ищем заголовочные файлы ядра (ntddk.h)
+          $headerFile = Get-ChildItem -Path $outDir -Filter "ntddk.h" -Recurse | Select-Object -First 1
+          if (-not $headerFile) {
+            Write-Error "ntddk.h not found in NuGet package"
+            exit 1
+          }
+          $sourceKmInc = $headerFile.DirectoryName
+          Write-Host "Found WDK Headers at: $sourceKmInc"
+
+          # Пути Windows Kits 10.0.26100.0, которые проверяет CMake / Ninja
+          $targetKitLib = "${env:ProgramFiles(x86)}\Windows Kits\10\Lib\10.0.26100.0\km\x64"
+          $targetKitInc = "${env:ProgramFiles(x86)}\Windows Kits\10\Include\10.0.26100.0\km"
+
+          New-Item -ItemType Directory -Force -Path $targetKitLib | Out-Null
+          New-Item -ItemType Directory -Force -Path $targetKitInc | Out-Null
+
+          Copy-Item -Path "$sourceKmLib\*" -Destination $targetKitLib -Recurse -Force
+          Copy-Item -Path "$sourceKmInc\*" -Destination $targetKitInc -Recurse -Force
+
+          # Проверка результата
+          if (Test-Path "$targetKitLib\ntoskrnl.lib") {
+            Write-Host "SUCCESS: Placed ntoskrnl.lib into $targetKitLib"
+          } else {
+            Write-Error "Failed to copy ntoskrnl.lib"
+            exit 1
+          }
 
       - name: Configure CMake
         shell: pwsh
@@ -40,7 +72,8 @@ jobs:
 
       - name: Build driver (Release)
         shell: pwsh
-        run: cmake --build build --config Release --target esp_drv
+        run: |
+          cmake --build build --config Release --target esp_drv
 
       - name: Upload .sys artifact
         uses: actions/upload-artifact@v4
