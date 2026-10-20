@@ -1,16 +1,32 @@
 // esp_drv.cpp — CS2 ESP kernel driver (manual map, no SEH, no STL/RTTI/exceptions)
-// build: MSVC + WDK, /kernel /GS- /GR- /EHs-c- /Zl
-// Entry: DriverEntry (called by manual mapper). No IoCreateDevice — comms via shared memory only.
+// build: MSVC + WDK, /kernel /GS- /GR- /EHs-c- /EHc- /Zl
+//
+// Guarantees:
+//   * No C++ exceptions       — /EHs-c- /EHc-, no try/throw/catch.
+//   * No RTTI                 — /GR-, no dynamic_cast, no typeid.
+//   * No SEH                  — no __try/__except/__finally.
+//   * No STL / C++ runtime    — only <ntifs.h>, <ntddk.h>, <intrin.h>.
+//   * No implicit new/delete  — all memory via ExAllocatePool2 / ExFreePoolWithTag.
 
 #include <ntifs.h>
 #include <ntddk.h>
 #include <intrin.h>
+#include <ntstrsafe.h>
+
+extern "C" NTSTATUS ZwQuerySystemInformation(
+    ULONG SystemInformationClass,
+    PVOID SystemInformation,
+    ULONG SystemInformationLength,
+    PULONG ReturnLength
+);
 
 #define POOL_TAG      'spSE'
 #define MAX_ENTITIES  256
 #define MAX_BONES     24
+#define MAX_LOGS      256
+#define LOG_LINE_MAX  128
 
-// ---- CS2 offsets (from a2x cs2-dumper, offsets.hpp + client_dll.hpp) ----
+// ---- CS2 offsets ----
 #define OFF_dwEntityList        0x271A908ULL
 #define OFF_dwLocalPlayerPawn   0x2565718ULL
 #define OFF_dwViewMatrix        0x256B020ULL
@@ -21,13 +37,9 @@
 #define OFF_m_modelState        0x140ULL
 #define OFF_m_hPlayerPawn       0x92CULL
 
-// canonical phys addr mask (52-bit, strips NX/avail bits that page tables leave set)
 #define PHYS_MASK_4K  0x000FFFFFFFFFF000ULL
 #define PHYS_MASK_2M  0x000FFFFFFFE00000ULL
 #define PHYS_MASK_1G  0x000FFFFFC0000000ULL
-
-// bone matrix: scene = *(pawn + m_pGameSceneNode); bMat = *(scene + m_modelState + 0x80)
-// — mirrors main.cpp exactly, see read site in Tick() for the resolved note.
 
 #pragma pack(push, 1)
 typedef struct _SHARED_BONE { float x, y, z; } SHARED_BONE;
@@ -44,8 +56,18 @@ typedef struct _SHARED_HEADER {
     ULONG entityCount;
     ULONG version;
 } SHARED_HEADER;
+typedef struct _SHARED_LOG_ENTRY {
+    ULONG tick;
+    char  text[LOG_LINE_MAX];
+} SHARED_LOG_ENTRY;
+typedef struct _SHARED_LOG {
+    volatile LONG head;
+    volatile LONG tail;
+    SHARED_LOG_ENTRY entries[MAX_LOGS];
+} SHARED_LOG;
 typedef struct _SHARED_BLOCK {
     SHARED_HEADER hdr;
+    SHARED_LOG    log;
     SHARED_ENTITY ents[MAX_ENTITIES];
 } SHARED_BLOCK;
 #pragma pack(pop)
@@ -63,7 +85,30 @@ static volatile LONG   g_stop = 0;
 static KEVENT          g_workerEvent;
 static PKTHREAD        g_workerThread = nullptr;
 
-// ---- CR3 page walker (physical read via MmMapIoSpace) ----
+// ---- logging: DbgPrintEx + ring in shared memory ----
+static volatile LONG   g_logTick = 0;
+static volatile LONG   g_statReads = 0;
+static volatile LONG   g_statReadFails = 0;
+
+static void LogRaw(const char* text) {
+    DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL, "[esp_drv] %s\n", text);
+    if (!g_sharedVa) return;
+    LONG tail = InterlockedIncrement(&g_sharedVa->log.tail) - 1;
+    LONG slot = tail % MAX_LOGS;
+    g_sharedVa->log.entries[slot].tick = (ULONG)InterlockedIncrement(&g_logTick);
+    RtlStringCchCopyA(g_sharedVa->log.entries[slot].text, LOG_LINE_MAX, text);
+}
+
+static void Log(const char* fmt, ...) {
+    char buf[LOG_LINE_MAX];
+    va_list ap;
+    va_start(ap, fmt);
+    RtlStringCchVPrintfA(buf, sizeof(buf), fmt, ap);
+    va_end(ap);
+    LogRaw(buf);
+}
+
+// ---- CR3 page walker ----
 static BOOLEAN ReadPhysical(ULONG64 phys, PVOID buf, SIZE_T size) {
     PHYSICAL_ADDRESS pa;
     pa.QuadPart = phys;
@@ -85,10 +130,10 @@ static ULONG64 VirtualToPhysical(ULONG64 cr3, ULONG64 va) {
     if (!(pml4e & 1)) return 0;
     ULONG64 pdpte = ReadPhysicalQword((pml4e & PHYS_MASK_4K) + 8 * ((va >> 30) & 0x1FF));
     if (!(pdpte & 1)) return 0;
-    if (pdpte & 0x80) return (pdpte & PHYS_MASK_1G) + (va & 0x3FFFFFFFULL); // 1GB page
+    if (pdpte & 0x80) return (pdpte & PHYS_MASK_1G) + (va & 0x3FFFFFFFULL);
     ULONG64 pde = ReadPhysicalQword((pdpte & PHYS_MASK_4K) + 8 * ((va >> 21) & 0x1FF));
     if (!(pde & 1)) return 0;
-    if (pde & 0x80) return (pde & PHYS_MASK_2M) + (va & 0x1FFFFFULL); // 2MB page
+    if (pde & 0x80) return (pde & PHYS_MASK_2M) + (va & 0x1FFFFFULL);
     ULONG64 pte = ReadPhysicalQword((pde & PHYS_MASK_4K) + 8 * ((va >> 12) & 0x1FF));
     if (!(pte & 1)) return 0;
     return (pte & PHYS_MASK_4K) + (va & 0xFFFULL);
@@ -101,10 +146,11 @@ static BOOLEAN ReadCs2Memory(ULONG64 va, PVOID buf, SIZE_T size) {
     while (done < size) {
         ULONG64 cur = va + done;
         ULONG64 phys = VirtualToPhysical(g_cs2Cr3, cur);
-        if (!phys) return FALSE;
+        if (!phys) { InterlockedIncrement(&g_statReadFails); return FALSE; }
         SIZE_T chunk = 0x1000 - (cur & 0xFFF);
         if (chunk > size - done) chunk = size - done;
-        if (!ReadPhysical(phys, out + done, chunk)) return FALSE;
+        if (!ReadPhysical(phys, out + done, chunk)) { InterlockedIncrement(&g_statReadFails); return FALSE; }
+        InterlockedIncrement(&g_statReads);
         done += chunk;
     }
     return TRUE;
@@ -152,20 +198,10 @@ typedef struct _SYSTEM_PROCESS_INFO {
     LARGE_INTEGER OtherTransferCount;
 } SYSTEM_PROCESS_INFO, *PSYSTEM_PROCESS_INFO;
 
-extern "C" NTSTATUS ZwQuerySystemInformation(
-    ULONG SystemInformationClass,
-    PVOID SystemInformation,
-    ULONG SystemInformationLength,
-    PULONG ReturnLength
-);
-
-// The SystemProcessInformation class value used in the code is 5, can define a constant
-#define SystemProcessInformation 5
-
 static PEPROCESS FindCs2Process() {
     ULONG size = 0x10000;
     PVOID buf = nullptr;
-    NTSTATUS st;
+    NTSTATUS st = STATUS_INFO_LENGTH_MISMATCH;
     for (int i = 0; i < 4; ++i) {
         buf = ExAllocatePool2(POOL_FLAG_NON_PAGED, size, POOL_TAG);
         if (!buf) return nullptr;
@@ -176,6 +212,7 @@ static PEPROCESS FindCs2Process() {
         size *= 2;
     }
     if (!buf) return nullptr;
+
     ANSI_STRING target; RtlInitAnsiString(&target, "cs2.exe");
     PSYSTEM_PROCESS_INFO spi = (PSYSTEM_PROCESS_INFO)buf;
     PEPROCESS found = nullptr;
@@ -199,22 +236,20 @@ static PEPROCESS FindCs2Process() {
 }
 
 static ULONG64 GetProcessCr3(PEPROCESS p) {
-    // KPROCESS.DirectoryTableBase at +0x28 on x64
     return *(ULONG64*)((PUCHAR)p + 0x28);
 }
 
-// Read PEB->Ldr->InLoadOrderModuleList to find module base (via CR3 walker)
 typedef struct _LDR_ENTRY_OFF {
-    LIST_ENTRY InLoadOrderLinks; // 0x00
-    PVOID ExceptionTable;        // 0x10
-    ULONG ExceptionTableSize;    // 0x18
-    PVOID GpValue;               // 0x20
-    PVOID NonPagedDebugInfo;     // 0x28
-    PVOID DllBase;               // 0x30
-    PVOID EntryPoint;            // 0x38
-    ULONG SizeOfImage;           // 0x40
-    UNICODE_STRING FullDllName;  // 0x48
-    UNICODE_STRING BaseDllName;  // 0x58
+    LIST_ENTRY InLoadOrderLinks;
+    PVOID ExceptionTable;
+    ULONG ExceptionTableSize;
+    PVOID GpValue;
+    PVOID NonPagedDebugInfo;
+    PVOID DllBase;
+    PVOID EntryPoint;
+    ULONG SizeOfImage;
+    UNICODE_STRING FullDllName;
+    UNICODE_STRING BaseDllName;
 } LDR_ENTRY_OFF;
 
 static ULONG64 FindModuleBase(PEPROCESS proc, PCWSTR moduleName) {
@@ -249,7 +284,7 @@ static ULONG64 FindModuleBase(PEPROCESS proc, PCWSTR moduleName) {
     return 0;
 }
 
-// ---- GetEntityByIndex (matches user code: entry = *(chunk + 112*slot)) ----
+// ---- GetEntityByIndex (same as main.cpp) ----
 static ULONG64 EntityByIndex(ULONG64 es, ULONG idx) {
     if (!es || idx > 0x7FFE) return 0;
     ULONG c = idx >> 9;
@@ -265,7 +300,6 @@ static ULONG64 EntityByIndex(ULONG64 es, ULONG idx) {
     return ent;
 }
 
-// ---- worker ----
 static void ClearShared() {
     if (!g_sharedVa) return;
     InterlockedIncrement(&g_sharedVa->hdr.seq);
@@ -274,61 +308,73 @@ static void ClearShared() {
 }
 
 static void Tick() {
-    // cheap liveness check on the cached base before paying for a full
-    // process-list + PEB walk every 10ms tick
+    static ULONG s_lastLog = 0;
+    ULONG now = (ULONG)InterlockedIncrement(&g_logTick) / 100; // ~раз в секунду при 10ms тике
+    bool logNow = (now != s_lastLog);
+    if (logNow) s_lastLog = now;
+
     USHORT mz = 0;
     bool baseAlive = g_cs2Cr3 && g_clientBase && ReadCs2Memory(g_clientBase, &mz, sizeof(mz)) && mz == 0x5A4D;
 
     if (!baseAlive) {
         g_cs2Cr3 = 0; g_clientBase = 0;
         PEPROCESS p = FindCs2Process();
-        if (!p) { ClearShared(); return; }
+        if (!p) { ClearShared(); if (logNow) Log("cs2.exe not found"); return; }
         g_cs2Cr3 = GetProcessCr3(p);
         g_clientBase = FindModuleBase(p, L"client.dll");
         ObDereferenceObject(p);
+        if (logNow) Log("re-discovered: cr3=%llx clientBase=%llx", g_cs2Cr3, g_clientBase);
         if (!g_cs2Cr3 || !g_clientBase) { ClearShared(); return; }
     }
 
-    RdQ(g_clientBase + OFF_dwLocalPlayerPawn, &g_localPawn);
-    RdQ(g_clientBase + OFF_dwEntityList, &g_entitySystem);
+    ULONG64 lp = 0, es = 0;
+    RdQ(g_clientBase + OFF_dwLocalPlayerPawn, &lp);
+    RdQ(g_clientBase + OFF_dwEntityList, &es);
+    g_localPawn = lp;
+    g_entitySystem = es;
 
     float vm[16] = {};
     ReadCs2Memory(g_clientBase + OFF_dwViewMatrix, vm, sizeof(vm));
     if (g_viewVa) RtlCopyMemory(g_viewVa, vm, sizeof(vm));
 
-    if (!g_localPawn || !g_entitySystem) { ClearShared(); return; }
+    if (logNow) Log("base=%llx cr3=%llx lp=%llx es=%llx vm[0]=%.3f vm[12]=%.3f",
+                    g_clientBase, g_cs2Cr3, lp, es, vm[0], vm[12]);
+
+    if (!lp || !es) { ClearShared(); return; }
 
     ULONG myTeam = 0;
-    RdD(g_localPawn + OFF_m_iTeamNum, &myTeam);
+    RdD(lp + OFF_m_iTeamNum, &myTeam);
 
     if (g_sharedVa) InterlockedIncrement(&g_sharedVa->hdr.seq);
     ULONG out = 0;
+    ULONG scanned = 0, ctrlOk = 0, pawnOk = 0, aliveOk = 0, boneOk = 0;
 
     for (ULONG i = 1; i <= 64 && out < MAX_ENTITIES; ++i) {
-        ULONG64 ctrl = EntityByIndex(g_entitySystem, i);
+        ++scanned;
+        ULONG64 ctrl = EntityByIndex(es, i);
         if (!ctrl) continue;
+        ++ctrlOk;
         ULONG hPawn = 0;
         if (!RdD(ctrl + OFF_m_hPlayerPawn, &hPawn)) continue;
         if (!hPawn || hPawn == 0xFFFFFFFF) continue;
-        ULONG64 pawn = EntityByIndex(g_entitySystem, hPawn & 0x7FFF);
-        if (!pawn || pawn == g_localPawn) continue;
+        ULONG64 pawn = EntityByIndex(es, hPawn & 0x7FFF);
+        if (!pawn || pawn == lp) continue;
+        ++pawnOk;
 
         ULONG hp = 0, ls = 0, team = 0;
         RdD(pawn + OFF_m_iHealth, &hp);
         RdD(pawn + OFF_m_lifeState, &ls);
         RdD(pawn + OFF_m_iTeamNum, &team);
         if ((int)hp <= 0 || (int)hp > 200 || ls != 256 || team == myTeam) continue;
+        ++aliveOk;
 
-        // scene = *(pawn + m_pGameSceneNode); bone matrix = *(scene + m_modelState + 0x80)
-        // matches user-mode: m_pGameSceneNode for a player pawn resolves directly to the
-        // CSkeletonInstance level, so no extra +0x80 BodyComponent hop needed here.
         ULONG64 scene = 0, bMat = 0;
         if (!RdQ(pawn + OFF_m_pGameSceneNode, &scene) || !scene) continue;
         if (!RdQ(scene + OFF_m_modelState + 0x80, &bMat) || !bMat) continue;
 
-        // one page-walked copy instead of MAX_BONES separate CR3 walks per entity
         UCHAR raw[MAX_BONES * 0x20];
         if (!ReadCs2Memory(bMat, raw, sizeof(raw))) continue;
+        ++boneOk;
 
         SHARED_ENTITY e = {};
         e.valid = 1; e.hp = (int)hp; e.team = (int)team;
@@ -343,11 +389,17 @@ static void Tick() {
         g_sharedVa->hdr.version = 1;
         InterlockedIncrement(&g_sharedVa->hdr.seq);
     }
+
+    if (logNow) {
+        Log("scan: scanned=%u ctrlOk=%u pawnOk=%u aliveOk=%u boneOk=%u out=%u reads=%ld fails=%ld",
+            scanned, ctrlOk, pawnOk, aliveOk, boneOk, out,
+            (long)g_statReads, (long)g_statReadFails);
+    }
 }
 
 static VOID WorkerThread(PVOID) {
     LARGE_INTEGER interval;
-    interval.QuadPart = -10 * 1000 * 10; // 10ms
+    interval.QuadPart = -10 * 1000 * 10;
     for (;;) {
         if (InterlockedCompareExchange(&g_stop, 0, 0)) break;
         Tick();
@@ -356,47 +408,57 @@ static VOID WorkerThread(PVOID) {
 }
 
 // ---- shared memory ----
-// Sections are created from a System-context worker thread, so with no explicit
-// SD they inherit System's default DACL (SYSTEM + Administrators only). An
-// unelevated usermode reader (overlay_dll.cpp injected into e.g. Discord.exe,
-// running as the plain logged-in user) gets ACCESS_DENIED on OpenFileMappingW.
-// Null DACL = any authenticated caller can open by name — fine for a read-only
-// snapshot; it also means ANY process on the box can map it, not just yours.
 static NTSTATUS BuildNullDaclSD(PSECURITY_DESCRIPTOR sd) {
     if (!NT_SUCCESS(RtlCreateSecurityDescriptor(sd, SECURITY_DESCRIPTOR_REVISION))) return STATUS_UNSUCCESSFUL;
-    // Dacl=NULL + Present=TRUE is the actual null-DACL: unrestricted access.
-    // An empty-but-present ACL (0 ACEs) would instead deny everyone.
     if (!NT_SUCCESS(RtlSetDaclSecurityDescriptor(sd, TRUE, nullptr, FALSE))) return STATUS_UNSUCCESSFUL;
     return STATUS_SUCCESS;
 }
 
-static NTSTATUS CreateShared() {
-    OBJECT_ATTRIBUTES oa; UNICODE_STRING name; LARGE_INTEGER sz; NTSTATUS st;
-
+static NTSTATUS OpenOrCreateSection(PCWSTR nameStr, HANDLE* outHandle, LARGE_INTEGER size) {
+    NTSTATUS st;
+    UNICODE_STRING name;
+    OBJECT_ATTRIBUTES oa;
     SECURITY_DESCRIPTOR sd;
+
     st = BuildNullDaclSD(&sd);
     if (!NT_SUCCESS(st)) return st;
 
-    RtlInitUnicodeString(&name, L"\\BaseNamedObjects\\Cs2EspShared_v1");
+    RtlInitUnicodeString(&name, nameStr);
     InitializeObjectAttributes(&oa, &name, OBJ_CASE_INSENSITIVE | OBJ_KERNEL_HANDLE, nullptr, &sd);
+    st = ZwCreateSection(outHandle, SECTION_ALL_ACCESS, &oa, &size, PAGE_READWRITE, SEC_COMMIT, nullptr);
+
+    if (st == STATUS_OBJECT_NAME_COLLISION) {
+        // Секция уже существует (например, kdmapper до этого уже грузил драйвер).
+        // Открываем существующую — это исправляет DriverEntry → 0xC0000035.
+        Log("section %ws exists, opening instead", nameStr);
+        InitializeObjectAttributes(&oa, &name, OBJ_CASE_INSENSITIVE | OBJ_KERNEL_HANDLE, nullptr, nullptr);
+        st = ZwOpenSection(outHandle, SECTION_ALL_ACCESS, &oa);
+    }
+    return st;
+}
+
+static NTSTATUS CreateShared() {
+    NTSTATUS st;
+    LARGE_INTEGER sz;
+
     sz.QuadPart = sizeof(SHARED_BLOCK);
-    st = ZwCreateSection(&g_hSharedSection, SECTION_ALL_ACCESS, &oa, &sz, PAGE_READWRITE, SEC_COMMIT, nullptr);
-    if (!NT_SUCCESS(st)) return st;
+    st = OpenOrCreateSection(L"\\BaseNamedObjects\\Cs2EspShared_v1", &g_hSharedSection, sz);
+    if (!NT_SUCCESS(st)) { Log("CreateSection shared failed %08x", st); return st; }
+
     PVOID base = nullptr; SIZE_T vs = 0;
     st = ZwMapViewOfSection(g_hSharedSection, ZwCurrentProcess(), &base, 0, 0, nullptr, &vs, ViewUnmap, 0, PAGE_READWRITE);
-    if (!NT_SUCCESS(st)) return st;
+    if (!NT_SUCCESS(st)) { Log("MapView shared failed %08x", st); return st; }
     g_sharedVa = (SHARED_BLOCK*)base;
     g_sharedVa->hdr.version = 1;
     g_sharedVa->hdr.maxEntities = MAX_ENTITIES;
 
-    RtlInitUnicodeString(&name, L"\\BaseNamedObjects\\Cs2EspView_v1");
-    InitializeObjectAttributes(&oa, &name, OBJ_CASE_INSENSITIVE | OBJ_KERNEL_HANDLE, nullptr, &sd);
     sz.QuadPart = 64;
-    st = ZwCreateSection(&g_hViewSection, SECTION_ALL_ACCESS, &oa, &sz, PAGE_READWRITE, SEC_COMMIT, nullptr);
-    if (!NT_SUCCESS(st)) return st;
+    st = OpenOrCreateSection(L"\\BaseNamedObjects\\Cs2EspView_v1", &g_hViewSection, sz);
+    if (!NT_SUCCESS(st)) { Log("CreateSection view failed %08x", st); return st; }
+
     base = nullptr;
     st = ZwMapViewOfSection(g_hViewSection, ZwCurrentProcess(), &base, 0, 0, nullptr, &vs, ViewUnmap, 0, PAGE_READWRITE);
-    if (!NT_SUCCESS(st)) return st;
+    if (!NT_SUCCESS(st)) { Log("MapView view failed %08x", st); return st; }
     g_viewVa = (float*)base;
     return STATUS_SUCCESS;
 }
@@ -408,7 +470,7 @@ static void DestroyShared() {
     if (g_hSharedSection)             { ZwClose(g_hSharedSection); g_hSharedSection = nullptr; }
 }
 
-// ---- DriverEntry (manual map safe) ----
+// ---- DriverEntry ----
 extern "C" NTSTATUS DriverEntry(PDRIVER_OBJECT drv, PUNICODE_STRING) {
     NTSTATUS st = CreateShared();
     if (!NT_SUCCESS(st)) return st;
@@ -421,8 +483,8 @@ extern "C" NTSTATUS DriverEntry(PDRIVER_OBJECT drv, PUNICODE_STRING) {
     ObReferenceObjectByHandle(h, THREAD_ALL_ACCESS, *PsThreadType, KernelMode, (PVOID*)&g_workerThread, nullptr);
     ZwClose(h);
 
-    // For manual mapping we can't rely on DriverUnload being called. We also
-    // don't create a device object — nothing to unload from IRP path.
+    Log("DriverEntry ok: shared=%p view=%p", g_sharedVa, g_viewVa);
+
     drv->DriverUnload = [](PDRIVER_OBJECT) {
         InterlockedExchange(&g_stop, 1);
         KeSetEvent(&g_workerEvent, 0, FALSE);
