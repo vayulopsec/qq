@@ -21,22 +21,13 @@
 #define OFF_m_modelState        0x140ULL
 #define OFF_m_hPlayerPawn       0x92CULL
 
-// CSkeletonInstance sits at CBodyComponentSkeletonInstance + 0x80,
-// and m_modelState is at CSkeletonInstance + 0x140.
-// Pawn->m_pGameSceneNode actually points to CGameSceneNode*; for skeletons the
-// real skeleton instance is reachable via BodyComponent (0x30) + 0x80. We use
-// the same shortcut as user-mode code: scene + 0x80 + m_modelState.
-// However main.cpp used scene + m_modelState + 0x80 — the game accepts both
-// because m_pGameSceneNode for pawns IS the CSkeletonInstance. We keep:
-//   boneMatrix = *(scene + 0x80 + OFF_m_modelState + 0x80)
-// where 0x80 = CSkeletonInstance inside CBodyComponentSkeletonInstance,
-// and scene itself is CGameSceneNode*, but for player pawns scene is actually
-// CSkeletonInstance* (already at the right level). So we use scene directly.
-// The user code: bMatrix = *(scene + m_modelState + 0x80) — 0x80 there is
-// CModelState.m_hModel offset? No. Actually user code is:
-//   scene = *(pawn + m_pGameSceneNode);
-//   bMatrix = *(scene + m_modelState + 0x80);
-// where 0x80 = ModelState.m_hModel? Let's just replicate user logic exactly.
+// canonical phys addr mask (52-bit, strips NX/avail bits that page tables leave set)
+#define PHYS_MASK_4K  0x000FFFFFFFFFF000ULL
+#define PHYS_MASK_2M  0x000FFFFFFFE00000ULL
+#define PHYS_MASK_1G  0x000FFFFFC0000000ULL
+
+// bone matrix: scene = *(pawn + m_pGameSceneNode); bMat = *(scene + m_modelState + 0x80)
+// — mirrors main.cpp exactly, see read site in Tick() for the resolved note.
 
 #pragma pack(push, 1)
 typedef struct _SHARED_BONE { float x, y, z; } SHARED_BONE;
@@ -90,17 +81,17 @@ static ULONG64 ReadPhysicalQword(ULONG64 phys) {
 }
 
 static ULONG64 VirtualToPhysical(ULONG64 cr3, ULONG64 va) {
-    ULONG64 pml4e = ReadPhysicalQword((cr3 & ~0xFFFULL) + 8 * ((va >> 39) & 0x1FF));
+    ULONG64 pml4e = ReadPhysicalQword((cr3 & PHYS_MASK_4K) + 8 * ((va >> 39) & 0x1FF));
     if (!(pml4e & 1)) return 0;
-    ULONG64 pdpte = ReadPhysicalQword((pml4e & ~0xFFFULL) + 8 * ((va >> 30) & 0x1FF));
+    ULONG64 pdpte = ReadPhysicalQword((pml4e & PHYS_MASK_4K) + 8 * ((va >> 30) & 0x1FF));
     if (!(pdpte & 1)) return 0;
-    if (pdpte & 0x80) return (pdpte & ~0x3FFFFFFFULL) + (va & 0x3FFFFFFFULL);
-    ULONG64 pde = ReadPhysicalQword((pdpte & ~0xFFFULL) + 8 * ((va >> 21) & 0x1FF));
+    if (pdpte & 0x80) return (pdpte & PHYS_MASK_1G) + (va & 0x3FFFFFFFULL); // 1GB page
+    ULONG64 pde = ReadPhysicalQword((pdpte & PHYS_MASK_4K) + 8 * ((va >> 21) & 0x1FF));
     if (!(pde & 1)) return 0;
-    if (pde & 0x80) return (pde & ~0x1FFFFFULL) + (va & 0x1FFFFFULL);
-    ULONG64 pte = ReadPhysicalQword((pde & ~0xFFFULL) + 8 * ((va >> 12) & 0x1FF));
+    if (pde & 0x80) return (pde & PHYS_MASK_2M) + (va & 0x1FFFFFULL); // 2MB page
+    ULONG64 pte = ReadPhysicalQword((pde & PHYS_MASK_4K) + 8 * ((va >> 12) & 0x1FF));
     if (!(pte & 1)) return 0;
-    return (pte & ~0xFFFULL) + (va & 0xFFFULL);
+    return (pte & PHYS_MASK_4K) + (va & 0xFFFULL);
 }
 
 static BOOLEAN ReadCs2Memory(ULONG64 va, PVOID buf, SIZE_T size) {
@@ -265,13 +256,28 @@ static ULONG64 EntityByIndex(ULONG64 es, ULONG idx) {
 }
 
 // ---- worker ----
+static void ClearShared() {
+    if (!g_sharedVa) return;
+    InterlockedIncrement(&g_sharedVa->hdr.seq);
+    g_sharedVa->hdr.entityCount = 0;
+    InterlockedIncrement(&g_sharedVa->hdr.seq);
+}
+
 static void Tick() {
-    PEPROCESS p = FindCs2Process();
-    if (!p) return;
-    g_cs2Cr3 = GetProcessCr3(p);
-    g_clientBase = FindModuleBase(p, L"client.dll");
-    ObDereferenceObject(p);
-    if (!g_cs2Cr3 || !g_clientBase) return;
+    // cheap liveness check on the cached base before paying for a full
+    // process-list + PEB walk every 10ms tick
+    USHORT mz = 0;
+    bool baseAlive = g_cs2Cr3 && g_clientBase && ReadCs2Memory(g_clientBase, &mz, sizeof(mz)) && mz == 0x5A4D;
+
+    if (!baseAlive) {
+        g_cs2Cr3 = 0; g_clientBase = 0;
+        PEPROCESS p = FindCs2Process();
+        if (!p) { ClearShared(); return; }
+        g_cs2Cr3 = GetProcessCr3(p);
+        g_clientBase = FindModuleBase(p, L"client.dll");
+        ObDereferenceObject(p);
+        if (!g_cs2Cr3 || !g_clientBase) { ClearShared(); return; }
+    }
 
     RdQ(g_clientBase + OFF_dwLocalPlayerPawn, &g_localPawn);
     RdQ(g_clientBase + OFF_dwEntityList, &g_entitySystem);
@@ -280,17 +286,10 @@ static void Tick() {
     ReadCs2Memory(g_clientBase + OFF_dwViewMatrix, vm, sizeof(vm));
     if (g_viewVa) RtlCopyMemory(g_viewVa, vm, sizeof(vm));
 
-    if (!g_localPawn || !g_entitySystem) {
-        if (g_sharedVa) {
-            InterlockedIncrement(&g_sharedVa->hdr.seq);
-            g_sharedVa->hdr.entityCount = 0;
-            InterlockedIncrement(&g_sharedVa->hdr.seq);
-        }
-        return;
-    }
+    if (!g_localPawn || !g_entitySystem) { ClearShared(); return; }
 
-    UCHAR myTeam = 0;
-    RdB(g_localPawn + OFF_m_iTeamNum, &myTeam);
+    ULONG myTeam = 0;
+    RdD(g_localPawn + OFF_m_iTeamNum, &myTeam);
 
     if (g_sharedVa) InterlockedIncrement(&g_sharedVa->hdr.seq);
     ULONG out = 0;
@@ -304,32 +303,28 @@ static void Tick() {
         ULONG64 pawn = EntityByIndex(g_entitySystem, hPawn & 0x7FFF);
         if (!pawn || pawn == g_localPawn) continue;
 
-        int hp = 0;
-        UCHAR ls = 0, team = 0;
-        RdD(pawn + OFF_m_iHealth, (PULONG)&hp);
-        RdB(pawn + OFF_m_lifeState, &ls);
-        RdB(pawn + OFF_m_iTeamNum, &team);
-        if (hp <= 0 || hp > 200 || ls != 256 || team == myTeam) continue;
+        ULONG hp = 0, ls = 0, team = 0;
+        RdD(pawn + OFF_m_iHealth, &hp);
+        RdD(pawn + OFF_m_lifeState, &ls);
+        RdD(pawn + OFF_m_iTeamNum, &team);
+        if ((int)hp <= 0 || (int)hp > 200 || ls != 256 || team == myTeam) continue;
 
-        // scene = *(pawn + m_pGameSceneNode); then bone matrix = *(scene + 0x80 + m_modelState + 0x80)
-        // user code used: scene + m_modelState + 0x80, where 0x80 is ModelState.m_hModel offset — but
-        // in fact CSkeletonInstance sits at CBodyComponentSkeletonInstance + 0x80, and m_pGameSceneNode
-        // for a player pawn points to the CSkeletonInstance (not raw CGameSceneNode). So user code
-        // scene + 0x140 + 0x80 = +0x1C0 is the bone matrix pointer location inside CSkeletonInstance.
+        // scene = *(pawn + m_pGameSceneNode); bone matrix = *(scene + m_modelState + 0x80)
+        // matches user-mode: m_pGameSceneNode for a player pawn resolves directly to the
+        // CSkeletonInstance level, so no extra +0x80 BodyComponent hop needed here.
         ULONG64 scene = 0, bMat = 0;
         if (!RdQ(pawn + OFF_m_pGameSceneNode, &scene) || !scene) continue;
         if (!RdQ(scene + OFF_m_modelState + 0x80, &bMat) || !bMat) continue;
 
+        // one page-walked copy instead of MAX_BONES separate CR3 walks per entity
+        UCHAR raw[MAX_BONES * 0x20];
+        if (!ReadCs2Memory(bMat, raw, sizeof(raw))) continue;
+
         SHARED_ENTITY e = {};
-        e.valid = 1; e.hp = hp; e.team = team;
-        for (int b = 0; b < MAX_BONES; ++b) {
-            float tmp[3] = {};
-            if (ReadCs2Memory(bMat + (ULONG64)b * 0x20, tmp, sizeof(tmp))) {
-                e.bones[b].x = tmp[0];
-                e.bones[b].y = tmp[1];
-                e.bones[b].z = tmp[2];
-            }
-        }
+        e.valid = 1; e.hp = (int)hp; e.team = (int)team;
+        for (int b = 0; b < MAX_BONES; ++b)
+            RtlCopyMemory(&e.bones[b], raw + (size_t)b * 0x20, sizeof(SHARED_BONE));
+
         if (g_sharedVa) g_sharedVa->ents[out] = e;
         ++out;
     }
