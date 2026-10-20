@@ -18,24 +18,130 @@
 #include <dwmapi.h>
 #include <cmath>
 #include <cstdint>
+#include <cstdio>
+#include <cstdarg>
 #include "imgui.h"
 #include "imgui_impl_win32.h"
 #include "imgui_impl_dx11.h"
 
-// ---- shared memory contract (must match driver) ----
+// ===========================================================================
+// shared memory contract — MUST match esp_drv.cpp exactly
+// ===========================================================================
 #pragma pack(push, 1)
 struct SharedBone { float x, y, z; };
 struct SharedEntity { int valid; int hp; int team; int pad0; SharedBone bones[24]; };
 struct SharedHeader { volatile LONG seq; ULONG maxEntities; ULONG entityCount; ULONG version; };
-struct SharedBlock { SharedHeader hdr; SharedEntity ents[256]; };
+
+static const int MAX_LOGS     = 256;
+static const int LOG_LINE_MAX = 128;
+struct SharedLogEntry { ULONG tick; char text[LOG_LINE_MAX]; };
+struct SharedLog { volatile LONG head; volatile LONG tail; SharedLogEntry entries[MAX_LOGS]; };
+
+struct SharedBlock { SharedHeader hdr; SharedLog log; SharedEntity ents[256]; };
 #pragma pack(pop)
 
-static HANDLE        g_map = nullptr;
-static SharedBlock*  g_shm = nullptr;
+static HANDLE        g_map     = nullptr;
+static SharedBlock*  g_shm     = nullptr;
 static HANDLE        g_viewMap = nullptr;
-static float*        g_view = nullptr;
+static float*        g_view    = nullptr;
 
-// ---- proxy version.dll exports (signatures MUST match winver.h) ----
+// ===========================================================================
+// logging: OutputDebugStringA + %TEMP%\cs2esp_overlay.log
+// ===========================================================================
+static FILE*            g_logFile       = nullptr;
+static CRITICAL_SECTION g_logCs;
+static volatile LONG    g_selfLogCount  = 0;
+static volatile LONG    g_logFlushCount = 0;
+
+static void LogOpen() {
+    // Инициализируем CS ПЕРВЫМ делом: даже если ниже что-то упадёт,
+    // EnterCriticalSection в LogSelf не будет на неинициализированной CS.
+    InitializeCriticalSection(&g_logCs);
+
+    wchar_t tmp[MAX_PATH];
+    DWORD n = GetTempPathW(MAX_PATH, tmp);
+    if (!n) return;
+
+    wchar_t pathW[MAX_PATH];
+    _snwprintf_s(pathW, MAX_PATH, _TRUNCATE, L"%scs2esp_overlay.log", tmp);
+
+    // MinGW-w64 не поддерживает ccs=UTF-8 в _wfopen_s → битый FILE* → AV.
+    // Открываем обычным fopen_s по ANSI-пути.
+    char pathA[MAX_PATH * 2];
+    if (!WideCharToMultiByte(CP_UTF8, 0, pathW, -1, pathA, sizeof(pathA), nullptr, nullptr)) return;
+    fopen_s(&g_logFile, pathA, "a");
+}
+
+static void LogFlushLocked() {
+    if (g_logFile) fflush(g_logFile);
+}
+
+static void LogSelf(const char* fmt, ...) {
+    char buf[512];
+    va_list ap; va_start(ap, fmt);
+    _vsnprintf_s(buf, sizeof(buf), _TRUNCATE, fmt, ap);
+    va_end(ap);
+
+    SYSTEMTIME st; GetLocalTime(&st);
+    char line[640];
+    _snprintf_s(line, sizeof(line), _TRUNCATE,
+                "[%02u:%02u:%02u.%03u][self] %s\n",
+                st.wHour, st.wMinute, st.wSecond, st.wMilliseconds, buf);
+
+    OutputDebugStringA(line);
+
+    EnterCriticalSection(&g_logCs);
+    if (g_logFile) {
+        fputs(line, g_logFile);
+        // fflush реже: раз в 16 записей, чтобы не дёргать диск на каждой строке
+        if (InterlockedIncrement(&g_logFlushCount) >= 16) {
+            InterlockedExchange(&g_logFlushCount, 0);
+            LogFlushLocked();
+        }
+    }
+    LeaveCriticalSection(&g_logCs);
+
+    InterlockedIncrement(&g_selfLogCount);
+}
+
+static void LogKernelLine(const SharedLogEntry& le) {
+    if (!le.text[0]) return;
+    char line[640];
+    _snprintf_s(line, sizeof(line), _TRUNCATE,
+                "[kernel #%u] %s\n", le.tick, le.text);
+    OutputDebugStringA(line);
+    EnterCriticalSection(&g_logCs);
+    if (g_logFile) {
+        fputs(line, g_logFile);
+        if (InterlockedIncrement(&g_logFlushCount) >= 16) {
+            InterlockedExchange(&g_logFlushCount, 0);
+            LogFlushLocked();
+        }
+    }
+    LeaveCriticalSection(&g_logCs);
+}
+
+// читаем новые строки из кольцевого буфера ядра (head-tail)
+static LONG g_lastKernelTail = 0;
+static void DrainKernelLogs() {
+    if (!g_shm) return;
+    LONG tail = g_shm->log.tail;
+    if (tail == g_lastKernelTail) return;
+    if (tail < g_lastKernelTail) g_lastKernelTail = 0;
+    LONG start = g_lastKernelTail;
+    LONG count = tail - start;
+    if (count > MAX_LOGS) { start = tail - MAX_LOGS; count = MAX_LOGS; }
+    for (LONG i = 0; i < count; ++i) {
+        LONG idx = (start + i) % MAX_LOGS;
+        if (idx < 0) idx += MAX_LOGS;
+        LogKernelLine(g_shm->log.entries[idx]);
+    }
+    g_lastKernelTail = tail;
+}
+
+// ===========================================================================
+// proxy version.dll exports (signatures MUST match winver.h)
+// ===========================================================================
 typedef WINBOOL (WINAPI* fnGVIA)(LPCSTR,DWORD,DWORD,LPVOID);
 typedef WINBOOL (WINAPI* fnGVIW)(LPCWSTR,DWORD,DWORD,LPVOID);
 typedef DWORD   (WINAPI* fnGVISA)(LPCSTR,LPDWORD);
@@ -62,18 +168,25 @@ static void LoadReal() {
     GetSystemDirectoryW(p, MAX_PATH);
     wcscat_s(p, L"\\version.dll");
     HMODULE h = LoadLibraryW(p);
-    if (!h) return;
+    if (!h) {
+        LogSelf("LoadReal: LoadLibraryW failed, err=%lu", GetLastError());
+        return;
+    }
     pGVIA  = (fnGVIA) GetProcAddress(h, "GetFileVersionInfoA");
     pGVIW  = (fnGVIW) GetProcAddress(h, "GetFileVersionInfoW");
     pGVISA = (fnGVISA)GetProcAddress(h, "GetFileVersionInfoSizeA");
     pGVISW = (fnGVISW)GetProcAddress(h, "GetFileVersionInfoSizeW");
     pVQVA  = (fnVQVA) GetProcAddress(h, "VerQueryValueA");
     pVQVW  = (fnVQVW) GetProcAddress(h, "VerQueryValueW");
+    LogSelf("LoadReal: real version.dll @ %p (procs: %p %p %p %p %p %p)",
+            h, pGVIA, pGVIW, pGVISA, pGVISW, pVQVA, pVQVW);
 }
 
-// ---- overlay ----
+// ===========================================================================
+// overlay
+// ===========================================================================
 static HWND g_hWnd = nullptr;
-static int  g_W, g_H;
+static int  g_W = 0, g_H = 0;
 static ID3D11Device*           g_dev = nullptr;
 static ID3D11DeviceContext*    g_ctx = nullptr;
 static IDXGISwapChain*         g_sc  = nullptr;
@@ -100,11 +213,16 @@ static bool CreateDev(HWND h) {
     sd.Flags = DXGI_SWAP_CHAIN_FLAG_ALLOW_MODE_SWITCH;
     D3D_FEATURE_LEVEL fl;
     D3D_FEATURE_LEVEL fls[] = { D3D_FEATURE_LEVEL_11_0, D3D_FEATURE_LEVEL_10_0 };
-    if (FAILED(D3D11CreateDeviceAndSwapChain(nullptr, D3D_DRIVER_TYPE_HARDWARE, nullptr, 0,
-        fls, 2, D3D11_SDK_VERSION, &sd, &g_sc, &g_dev, &fl, &g_ctx))) return false;
+    HRESULT hr = D3D11CreateDeviceAndSwapChain(nullptr, D3D_DRIVER_TYPE_HARDWARE, nullptr, 0,
+        fls, 2, D3D11_SDK_VERSION, &sd, &g_sc, &g_dev, &fl, &g_ctx);
+    if (FAILED(hr)) {
+        LogSelf("D3D11CreateDeviceAndSwapChain failed hr=0x%08lX", (unsigned long)hr);
+        return false;
+    }
     ID3D11Texture2D* bb = nullptr;
     g_sc->GetBuffer(0, IID_PPV_ARGS(&bb));
     if (bb) { g_dev->CreateRenderTargetView(bb, nullptr, &g_rtv); bb->Release(); }
+    LogSelf("CreateDev ok: dev=%p ctx=%p sc=%p rtv=%p", g_dev, g_ctx, g_sc, g_rtv);
     return true;
 }
 
@@ -128,8 +246,43 @@ static const int CONN[][2] = {
     {6,13},{13,14},{14,15},{1,17},{17,18},{18,19},{1,20},{20,21},{21,22}
 };
 
+// ---- debug HUD: статус + логи ядра ----
+static void DrawStatus(ImDrawList* d) {
+    char line[256];
+    LONG seq  = g_shm ? g_shm->hdr.seq : -1;
+    ULONG n   = g_shm ? g_shm->hdr.entityCount : 0;
+    ULONG ver = g_shm ? g_shm->hdr.version : 0;
+    _snprintf_s(line, sizeof(line), _TRUNCATE,
+        "shm=%s view=%s | seq=%ld entities=%lu ver=%lu | W=%d H=%d",
+        g_shm ? "OK" : "NULL",
+        g_view ? "OK" : "NULL",
+        seq, n, ver, g_W, g_H);
+    d->AddText({10.f, 8.f}, IM_COL32(0,255,0,255), line);
+}
+
+static void DrawKernelLogs(ImDrawList* d) {
+    if (!g_shm) return;
+    LONG tail = g_shm->log.tail;
+    float y = 28.f;
+    // рисуем 8 последних записей (сверху — самая свежая)
+    for (int i = 1; i <= 8; ++i) {
+        LONG idx = (tail - i) % MAX_LOGS;
+        if (idx < 0) idx += MAX_LOGS;
+        const SharedLogEntry& le = g_shm->log.entries[idx];
+        if (!le.text[0]) continue;
+        char buf[LOG_LINE_MAX + 32];
+        _snprintf_s(buf, sizeof(buf), _TRUNCATE, "#%u %s", le.tick, le.text);
+        d->AddText({10.f, y}, IM_COL32(0,200,0,220), buf);
+        y += 15.f;
+    }
+}
+
 static void Render(ImDrawList* d) {
+    DrawStatus(d);
+    DrawKernelLogs(d);
+
     if (!g_shm || !g_view) return;
+
     LONG s1 = g_shm->hdr.seq;
     if (s1 & 1) return;
     ULONG n = g_shm->hdr.entityCount;
@@ -169,10 +322,51 @@ static void Render(ImDrawList* d) {
     }
 }
 
+static DWORD WINAPI DiagThread(LPVOID) {
+    unsigned diagCounter = 0;
+    for (;;) {
+        // Если драйвер загрузился ПОЗЖЕ version.dll — переоткрываем секции
+        if (!g_shm) {
+            HANDLE m = OpenFileMappingW(FILE_MAP_READ, FALSE, L"Global\\Cs2EspShared_v1");
+            if (m) {
+                g_shm = (SharedBlock*)MapViewOfFile(m, FILE_MAP_READ, 0, 0, sizeof(SharedBlock));
+                if (g_shm) { g_map = m; LogSelf("DiagThread: late OpenFileMapping(Shared) ok shm=%p", g_shm); }
+                else CloseHandle(m);
+            }
+        }
+        if (!g_view) {
+            HANDLE m = OpenFileMappingW(FILE_MAP_READ, FALSE, L"Global\\Cs2EspView_v1");
+            if (m) {
+                g_view = (float*)MapViewOfFile(m, FILE_MAP_READ, 0, 0, 0x1000);
+                if (g_view) { g_viewMap = m; LogSelf("DiagThread: late OpenFileMapping(View) ok view=%p", g_view); }
+                else CloseHandle(m);
+            }
+        }
+
+        DrainKernelLogs();
+        if (++diagCounter >= 5) {
+            diagCounter = 0;
+            if (g_shm) {
+                LogSelf("diag: seq=%ld entities=%lu ver=%lu logTail=%ld",
+                        g_shm->hdr.seq, g_shm->hdr.entityCount, g_shm->hdr.version,
+                        g_shm->log.tail);
+            } else {
+                LogSelf("diag: g_shm=NULL (OpenFileMappingW failed?)");
+            }
+        }
+        Sleep(1000);
+    }
+    return 0;
+}
+
 static DWORD WINAPI OverlayThread(LPVOID) {
+    LogSelf("OverlayThread: started, sleeping 3s to let Discord init");
     Sleep(3000);
+
     g_W = GetSystemMetrics(SM_CXSCREEN);
     g_H = GetSystemMetrics(SM_CYSCREEN);
+    LogSelf("OverlayThread: screen=%dx%d", g_W, g_H);
+
     WNDCLASSEXW wc = { sizeof(wc), CS_CLASSDC, WndProc, 0, 0, GetModuleHandleW(nullptr),
                        LoadIcon(nullptr, IDI_APPLICATION), LoadCursor(nullptr, IDC_ARROW),
                        nullptr, nullptr, L"DiscordOvClass", nullptr };
@@ -181,13 +375,21 @@ static DWORD WINAPI OverlayThread(LPVOID) {
         WS_EX_TOPMOST | WS_EX_TRANSPARENT | WS_EX_LAYERED | WS_EX_APPWINDOW | WS_EX_NOACTIVATE,
         wc.lpszClassName, L"Discord Overlay", WS_POPUP, 0, 0, g_W, g_H,
         nullptr, nullptr, wc.hInstance, nullptr);
-    if (!g_hWnd) return 0;
+    if (!g_hWnd) {
+        LogSelf("OverlayThread: CreateWindowExW failed err=%lu", GetLastError());
+        return 0;
+    }
+    LogSelf("OverlayThread: hwnd=%p", g_hWnd);
+
     MARGINS m = { -1 };
     DwmExtendFrameIntoClientArea(g_hWnd, &m);
     SetLayeredWindowAttributes(g_hWnd, 0, 255, LWA_ALPHA);
     SetWindowDisplayAffinity(g_hWnd, 0x11);
 
-    if (!CreateDev(g_hWnd)) { CleanDev(); DestroyWindow(g_hWnd); return 0; }
+    if (!CreateDev(g_hWnd)) {
+        LogSelf("OverlayThread: CreateDev failed, aborting");
+        CleanDev(); DestroyWindow(g_hWnd); return 0;
+    }
     ShowWindow(g_hWnd, SW_SHOW);
 
     IMGUI_CHECKVERSION();
@@ -195,8 +397,10 @@ static DWORD WINAPI OverlayThread(LPVOID) {
     ImGui::GetIO().IniFilename = nullptr;
     ImGui_ImplWin32_Init(g_hWnd);
     ImGui_ImplDX11_Init(g_dev, g_ctx);
+    LogSelf("OverlayThread: ImGui initialized (win32 + dx11)");
 
     MSG msg = {};
+    unsigned long long frame = 0;
     while (g_run && msg.message != WM_QUIT) {
         if (PeekMessageW(&msg, nullptr, 0, 0, PM_REMOVE)) {
             TranslateMessage(&msg); DispatchMessageW(&msg); continue;
@@ -217,22 +421,63 @@ static DWORD WINAPI OverlayThread(LPVOID) {
         g_ctx->OMSetRenderTargets(1, &g_rtv, nullptr);
         g_ctx->ClearRenderTargetView(g_rtv, clr);
         ImGui_ImplDX11_RenderDrawData(ImGui::GetDrawData());
-        g_sc->Present(1, 0);
+        HRESULT hr = g_sc->Present(1, 0);
+        if (frame < 3) {
+            LogSelf("OverlayThread: frame=%llu Present hr=0x%08lX", frame, (unsigned long)hr);
+        }
+        if (frame == 60) {
+            LogSelf("OverlayThread: 60 frames rendered, shm=%p view=%p",
+                    g_shm, g_view);
+        }
+        ++frame;
     }
+    LogSelf("OverlayThread: exiting loop, frames=%llu", frame);
+
     ImGui_ImplDX11_Shutdown(); ImGui_ImplWin32_Shutdown(); ImGui::DestroyContext();
     CleanDev(); DestroyWindow(g_hWnd); UnregisterClassW(wc.lpszClassName, wc.hInstance);
     return 0;
 }
 
+// ===========================================================================
+// InitThread — всё, что нельзя делать в DllMain (loader lock)
+// ===========================================================================
+static DWORD WINAPI InitThread(LPVOID) {
+    LogOpen();
+    LogSelf("InitThread: started pid=%lu", GetCurrentProcessId());
+
+    LoadReal();
+
+    g_map = OpenFileMappingW(FILE_MAP_READ, FALSE, L"Global\\Cs2EspShared_v1");
+    if (g_map) {
+        g_shm = (SharedBlock*)MapViewOfFile(g_map, FILE_MAP_READ, 0, 0, sizeof(SharedBlock));
+        LogSelf("InitThread: OpenFileMapping(Shared) ok map=%p shm=%p size=%zu",
+                g_map, g_shm, sizeof(SharedBlock));
+    } else {
+        LogSelf("InitThread: OpenFileMapping(Shared) FAILED err=%lu — драйвер не загружен или имя не совпадает",
+                GetLastError());
+    }
+
+    g_viewMap = OpenFileMappingW(FILE_MAP_READ, FALSE, L"Global\\Cs2EspView_v1");
+    if (g_viewMap) {
+        g_view = (float*)MapViewOfFile(g_viewMap, FILE_MAP_READ, 0, 0, 0x1000);
+        LogSelf("InitThread: OpenFileMapping(View) ok map=%p view=%p",
+                g_viewMap, g_view);
+    } else {
+        LogSelf("InitThread: OpenFileMapping(View) FAILED err=%lu", GetLastError());
+    }
+
+    CreateThread(nullptr, 0, DiagThread, nullptr, 0, nullptr);
+    OverlayThread(nullptr);
+    return 0;
+}
+
+// ===========================================================================
+// DllMain — только CreateThread, никаких LoadLibrary/OpenFileMapping/CRT
+// ===========================================================================
 BOOL WINAPI DllMain(HINSTANCE h, DWORD r, LPVOID) {
     if (r == DLL_PROCESS_ATTACH) {
         DisableThreadLibraryCalls(h);
-        LoadReal();
-        g_map = OpenFileMappingW(FILE_MAP_READ, FALSE, L"Global\\Cs2EspShared_v1");
-        if (g_map) g_shm = (SharedBlock*)MapViewOfFile(g_map, FILE_MAP_READ, 0, 0, sizeof(SharedBlock));
-        g_viewMap = OpenFileMappingW(FILE_MAP_READ, FALSE, L"Global\\Cs2EspView_v1");
-        if (g_viewMap) g_view = (float*)MapViewOfFile(g_viewMap, FILE_MAP_READ, 0, 0, 64);
-        CreateThread(nullptr, 0, OverlayThread, nullptr, 0, nullptr);
+        CreateThread(nullptr, 0, InitThread, nullptr, 0, nullptr);
     }
     return TRUE;
 }
