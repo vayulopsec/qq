@@ -528,7 +528,7 @@ static NTSTATUS OpenOrCreateSection(PCWSTR nameStr, HANDLE* outHandle, LARGE_INT
     if (st == STATUS_OBJECT_NAME_COLLISION) {
         // Секция уже существует (например, kdmapper до этого уже грузил драйвер).
         // Открываем существующую — это исправляет DriverEntry → 0xC0000035.
-        Log("section %ws exists, opening instead", nameStr);
+        Log("section exists, opening instead");
         InitializeObjectAttributes(&oa, &name, OBJ_CASE_INSENSITIVE | OBJ_KERNEL_HANDLE, nullptr, nullptr);
         st = ZwOpenSection(outHandle, SECTION_ALL_ACCESS, &oa);
     }
@@ -538,26 +538,37 @@ static NTSTATUS OpenOrCreateSection(PCWSTR nameStr, HANDLE* outHandle, LARGE_INT
 static NTSTATUS CreateShared() {
     NTSTATUS st;
     LARGE_INTEGER sz;
+    PVOID base = nullptr;
+    SIZE_T vs = 0;
 
-    sz.QuadPart = sizeof(SHARED_BLOCK);
-    st = OpenOrCreateSection(L"\\BaseNamedObjects\\Cs2EspShared_v1", &g_hSharedSection, sz);
-    if (!NT_SUCCESS(st)) { Log("CreateSection shared failed %08x", st); return st; }
+    // ---------- shared (большая секция) ----------
+    if (!g_sharedVa) {
+        sz.QuadPart = sizeof(SHARED_BLOCK);
+        st = OpenOrCreateSection(L"\\BaseNamedObjects\\Cs2EspShared_v1", &g_hSharedSection, sz);
+        if (!NT_SUCCESS(st)) { Log("CreateSection shared failed %x", (unsigned)st); return st; }
 
-    PVOID base = nullptr; SIZE_T vs = 0;
-    st = ZwMapViewOfSection(g_hSharedSection, ZwCurrentProcess(), &base, 0, 0, nullptr, &vs, ViewUnmap, 0, PAGE_READWRITE);
-    if (!NT_SUCCESS(st)) { Log("MapView shared failed %08x", st); return st; }
-    g_sharedVa = (SHARED_BLOCK*)base;
-    g_sharedVa->hdr.version = 1;
-    g_sharedVa->hdr.maxEntities = MAX_ENTITIES;
+        base = nullptr; vs = 0;
+        st = ZwMapViewOfSection(g_hSharedSection, ZwCurrentProcess(), &base, 0, 0, nullptr, &vs, ViewUnmap, 0, PAGE_READWRITE);
+        if (!NT_SUCCESS(st)) { Log("MapView shared failed %x", (unsigned)st); return st; }
 
-    sz.QuadPart = 64;
-    st = OpenOrCreateSection(L"\\BaseNamedObjects\\Cs2EspView_v1", &g_hViewSection, sz);
-    if (!NT_SUCCESS(st)) { Log("CreateSection view failed %08x", st); return st; }
+        g_sharedVa = (SHARED_BLOCK*)base;
+        g_sharedVa->hdr.version = 1;
+        g_sharedVa->hdr.maxEntities = MAX_ENTITIES;
+    }
 
-    base = nullptr;
-    st = ZwMapViewOfSection(g_hViewSection, ZwCurrentProcess(), &base, 0, 0, nullptr, &vs, ViewUnmap, 0, PAGE_READWRITE);
-    if (!NT_SUCCESS(st)) { Log("MapView view failed %08x", st); return st; }
-    g_viewVa = (float*)base;
+    // ---------- view (маленькая секция) ----------
+    if (!g_viewVa) {
+        sz.QuadPart = 0x1000;   // 4096 — кратно странице, надёжнее 64
+        st = OpenOrCreateSection(L"\\BaseNamedObjects\\Cs2EspView_v1", &g_hViewSection, sz);
+        if (!NT_SUCCESS(st)) { Log("CreateSection view failed %x", (unsigned)st); return st; }
+
+        base = nullptr; vs = 0;
+        st = ZwMapViewOfSection(g_hViewSection, ZwCurrentProcess(), &base, 0, 0, nullptr, &vs, ViewUnmap, 0, PAGE_READWRITE);
+        if (!NT_SUCCESS(st)) { Log("MapView view failed %x", (unsigned)st); return st; }
+
+        g_viewVa = (float*)base;
+    }
+
     return STATUS_SUCCESS;
 }
 
