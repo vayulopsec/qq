@@ -20,6 +20,26 @@ extern "C" NTSTATUS ZwQuerySystemInformation(
     PULONG ReturnLength
 );
 
+// ---- ZwQuerySection: не объявлен в WDK headers — добавляем вручную ----
+typedef enum _SECTION_INFORMATION_CLASS {
+    SectionBasicInformation = 0,
+    SectionImageInformation = 1
+} SECTION_INFORMATION_CLASS;
+
+typedef struct _SECTION_BASIC_INFORMATION {
+    PVOID       BaseAddress;
+    ULONG       Attributes;
+    LARGE_INTEGER Size;
+} SECTION_BASIC_INFORMATION, *PSECTION_BASIC_INFORMATION;
+
+extern "C" NTSTATUS ZwQuerySection(
+    HANDLE SectionHandle,
+    SECTION_INFORMATION_CLASS SectionInformationClass,
+    PVOID SectionInformation,
+    SIZE_T SectionInformationLength,
+    PSIZE_T ReturnLength
+);
+
 #define POOL_TAG      'spSE'
 #define MAX_ENTITIES  256
 #define MAX_BONES     24
@@ -506,7 +526,7 @@ static NTSTATUS BuildEveryoneSd(PSECURITY_DESCRIPTOR sd, PVOID* outAcl) {
     RtlZeroMemory(p, 0x50);
 
     PACL acl = (PACL)(p + sizeof(SECURITY_DESCRIPTOR));
-    PSID sid = (PSID)((PUCHAR)acl + 0x10 + 0x0C);
+    PISID sid = (PISID)((PUCHAR)acl + 0x10 + 0x0C);
 
     sid->Revision = 1;
     sid->SubAuthorityCount = 1;
@@ -584,10 +604,10 @@ static NTSTATUS CreateShared() {
         RtlZeroMemory(&sbi, sizeof(sbi));
         st = ZwQuerySection(g_hSharedSection, SectionBasicInformation, &sbi, sizeof(sbi), nullptr);
         if (NT_SUCCESS(st)) {
-            Log("shared: MaximumSize=%llx need=%llx",
-                (unsigned long long)sbi.MaximumSize.QuadPart,
+            Log("shared: Size=%llx need=%llx",
+                (unsigned long long)sbi.Size.QuadPart,
                 (unsigned long long)sizeof(SHARED_BLOCK));
-            if (sbi.MaximumSize.QuadPart < (ULONGLONG)sizeof(SHARED_BLOCK)) {
+            if (sbi.Size.QuadPart < (ULONGLONG)sizeof(SHARED_BLOCK)) {
                 Log("shared: too small, stale section. Reboot required.");
                 ZwClose(g_hSharedSection); g_hSharedSection = nullptr;
                 return STATUS_INVALID_PARAMETER;
@@ -614,9 +634,9 @@ static NTSTATUS CreateShared() {
         RtlZeroMemory(&sbi, sizeof(sbi));
         st = ZwQuerySection(g_hViewSection, SectionBasicInformation, &sbi, sizeof(sbi), nullptr);
         if (NT_SUCCESS(st)) {
-            Log("view: MaximumSize=%llx need>=40",
-                (unsigned long long)sbi.MaximumSize.QuadPart);
-            if (sbi.MaximumSize.QuadPart < 64ULL) {
+            Log("view: Size=%llx need>=40",
+                (unsigned long long)sbi.Size.QuadPart);
+            if (sbi.Size.QuadPart < 64ULL) {
                 Log("view: too small, stale section. Reboot required.");
                 ZwClose(g_hViewSection); g_hViewSection = nullptr;
                 return STATUS_INVALID_PARAMETER;
