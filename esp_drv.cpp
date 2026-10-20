@@ -346,11 +346,29 @@ static VOID WorkerThread(PVOID) {
 }
 
 // ---- shared memory ----
+// Sections are created from a System-context worker thread, so with no explicit
+// SD they inherit System's default DACL (SYSTEM + Administrators only). An
+// unelevated usermode reader (overlay_dll.cpp injected into e.g. Discord.exe,
+// running as the plain logged-in user) gets ACCESS_DENIED on OpenFileMappingW.
+// Null DACL = any authenticated caller can open by name — fine for a read-only
+// snapshot; it also means ANY process on the box can map it, not just yours.
+static NTSTATUS BuildNullDaclSD(PSECURITY_DESCRIPTOR sd) {
+    if (!NT_SUCCESS(RtlCreateSecurityDescriptor(sd, SECURITY_DESCRIPTOR_REVISION))) return STATUS_UNSUCCESSFUL;
+    // Dacl=NULL + Present=TRUE is the actual null-DACL: unrestricted access.
+    // An empty-but-present ACL (0 ACEs) would instead deny everyone.
+    if (!NT_SUCCESS(RtlSetDaclSecurityDescriptor(sd, TRUE, nullptr, FALSE))) return STATUS_UNSUCCESSFUL;
+    return STATUS_SUCCESS;
+}
+
 static NTSTATUS CreateShared() {
     OBJECT_ATTRIBUTES oa; UNICODE_STRING name; LARGE_INTEGER sz; NTSTATUS st;
 
+    SECURITY_DESCRIPTOR sd;
+    st = BuildNullDaclSD(&sd);
+    if (!NT_SUCCESS(st)) return st;
+
     RtlInitUnicodeString(&name, L"\\BaseNamedObjects\\Cs2EspShared_v1");
-    InitializeObjectAttributes(&oa, &name, OBJ_CASE_INSENSITIVE | OBJ_KERNEL_HANDLE, nullptr, nullptr);
+    InitializeObjectAttributes(&oa, &name, OBJ_CASE_INSENSITIVE | OBJ_KERNEL_HANDLE, nullptr, &sd);
     sz.QuadPart = sizeof(SHARED_BLOCK);
     st = ZwCreateSection(&g_hSharedSection, SECTION_ALL_ACCESS, &oa, &sz, PAGE_READWRITE, SEC_COMMIT, nullptr);
     if (!NT_SUCCESS(st)) return st;
@@ -362,7 +380,7 @@ static NTSTATUS CreateShared() {
     g_sharedVa->hdr.maxEntities = MAX_ENTITIES;
 
     RtlInitUnicodeString(&name, L"\\BaseNamedObjects\\Cs2EspView_v1");
-    InitializeObjectAttributes(&oa, &name, OBJ_CASE_INSENSITIVE | OBJ_KERNEL_HANDLE, nullptr, nullptr);
+    InitializeObjectAttributes(&oa, &name, OBJ_CASE_INSENSITIVE | OBJ_KERNEL_HANDLE, nullptr, &sd);
     sz.QuadPart = 64;
     st = ZwCreateSection(&g_hViewSection, SECTION_ALL_ACCESS, &oa, &sz, PAGE_READWRITE, SEC_COMMIT, nullptr);
     if (!NT_SUCCESS(st)) return st;
