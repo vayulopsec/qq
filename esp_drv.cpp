@@ -105,6 +105,7 @@ static ULONG*        g_viewVa         = nullptr;
 
 static ULONG64       g_cs2Cr3         = 0;
 static ULONG64       g_clientBase     = 0;
+static HANDLE        g_cs2Pid         = nullptr;   // NEW: сохранённый PID cs2.exe
 static ULONG64       g_localPawn      = 0;
 static ULONG64       g_entitySystem   = 0;
 static volatile LONG g_stop           = 0;
@@ -227,7 +228,6 @@ static __forceinline BOOLEAN ReadPhysicalCached(ULONG64 phys, PVOID buf, SIZE_T 
     PHYSICAL_ADDRESS pa;
     pa.QuadPart = (LONGLONG)phys;
 
-    // MmMapIoSpaceEx с PAGE_READONLY использует MmCached на x86_64 без оверхеда MmCopyMemory
     PVOID mapped = MmMapIoSpaceEx(pa, size, PAGE_READONLY);
     if (!mapped) return FALSE;
 
@@ -310,8 +310,6 @@ static BOOLEAN ReadCs2Memory(ULONG64 va, PVOID buf, SIZE_T size) {
         SIZE_T chunk = 0x1000 - (curVa & 0xFFF);
         if (chunk > size - done) chunk = size - done;
 
-        // Проверяем, являются ли следующие виртуальные страницы физически непрерывными,
-        // чтобы смапить их одним вызовом MmMapIoSpaceEx
         while (done + chunk < size) {
             ULONG64 nextVa = curVa + chunk;
             ULONG64 nextPhys = VirtualToPhysical(g_cs2Cr3, nextVa);
@@ -349,7 +347,8 @@ typedef struct _SYSTEM_PROCESS_INFO {
     LARGE_INTEGER WriteTransferCount; LARGE_INTEGER OtherTransferCount;
 } SYSTEM_PROCESS_INFO, *PSYSTEM_PROCESS_INFO;
 
-static PEPROCESS FindCs2Process() {
+// Возвращает PEPROCESS и (опционально) PID
+static PEPROCESS FindCs2Process(HANDLE* outPid = nullptr) {
     ULONG size = 0x20000;
     PVOID buf = nullptr;
     NTSTATUS st = STATUS_INFO_LENGTH_MISMATCH;
@@ -369,11 +368,13 @@ static PEPROCESS FindCs2Process() {
     RtlInitUnicodeString(&target, L"cs2.exe");
     PSYSTEM_PROCESS_INFO spi = (PSYSTEM_PROCESS_INFO)buf;
     PEPROCESS found = nullptr;
+    HANDLE foundPid = nullptr;
 
     for (;;) {
         if (spi->ImageName.Buffer && spi->ImageName.Length) {
             if (RtlEqualUnicodeString(&spi->ImageName, &target, TRUE)) {
                 if (NT_SUCCESS(PsLookupProcessByProcessId(spi->UniqueProcessId, &found))) {
+                    foundPid = spi->UniqueProcessId;
                     break;
                 }
             }
@@ -382,10 +383,12 @@ static PEPROCESS FindCs2Process() {
         spi = (PSYSTEM_PROCESS_INFO)((PUCHAR)spi + spi->NextEntryOffset);
     }
     ExFreePoolWithTag(buf, POOL_TAG);
+    if (outPid) *outPid = foundPid;
     return found;
 }
 
 static __forceinline ULONG64 GetProcessCr3(PEPROCESS p) {
+    // Offset подтверждён через dt nt!_KPROCESS: +0x028 DirectoryTableBase
     return *(ULONG64*)((PUCHAR)p + 0x28);
 }
 
@@ -395,28 +398,43 @@ typedef struct _LDR_ENTRY_OFF {
     UNICODE_STRING FullDllName; UNICODE_STRING BaseDllName;
 } LDR_ENTRY_OFF;
 
-static ULONG64 FindModuleBase(PEPROCESS proc, PCWSTR moduleName) {
+// verbose=true — выводит диагностику (используется только при первом поиске модуля)
+static ULONG64 FindModuleBase(PEPROCESS proc, PCWSTR moduleName, bool verbose) {
     UNICODE_STRING fnName;
     RtlInitUnicodeString(&fnName, L"PsGetProcessPeb");
     typedef PVOID(*fnPeb)(PEPROCESS);
     fnPeb fn = (fnPeb)MmGetSystemRoutineAddress(&fnName);
-    if (!fn) return 0;
+    if (!fn) { if (verbose) Log("FMB: PsGetProcessPeb not resolved"); return 0; }
 
     ULONG64 peb = (ULONG64)fn(proc);
+    if (verbose) Log("FMB: peb=%llx", peb);
     if (!peb) return 0;
 
     UNICODE_STRING want;
     RtlInitUnicodeString(&want, moduleName);
 
     ULONG64 ldr = 0;
-    if (!RdQ(peb + 0x18, &ldr) || !ldr) return 0;
+    if (!RdQ(peb + 0x18, &ldr) || !ldr) {
+        if (verbose) Log("FMB: ldr read fail/null (client.dll not loaded yet?)");
+        return 0;
+    }
+    if (verbose) Log("FMB: ldr=%llx", ldr);
+
     ULONG64 head = ldr + 0x10;
     ULONG64 cur = 0;
-    if (!RdQ(head, &cur)) return 0;
+    if (!RdQ(head, &cur)) {
+        if (verbose) Log("FMB: head read fail");
+        return 0;
+    }
+    if (verbose) Log("FMB: head=%llx firstCur=%llx", head, cur);
 
-    for (int guard = 0; guard < 512 && cur && cur != head; ++guard) {
+    int guard = 0;
+    for (; guard < 512 && cur && cur != head; ++guard) {
         LDR_ENTRY_OFF e = {};
-        if (!ReadCs2Memory(cur, &e, sizeof(e))) return 0;
+        if (!ReadCs2Memory(cur, &e, sizeof(e))) {
+            if (verbose) Log("FMB: entry read fail cur=%llx guard=%d", cur, guard);
+            return 0;
+        }
         if (e.BaseDllName.Buffer && e.BaseDllName.Length) {
             WCHAR n[128] = {};
             USHORT len = e.BaseDllName.Length;
@@ -425,11 +443,15 @@ static ULONG64 FindModuleBase(PEPROCESS proc, PCWSTR moduleName) {
                 n[len / sizeof(WCHAR)] = 0;
                 UNICODE_STRING un;
                 RtlInitUnicodeString(&un, n);
-                if (RtlEqualUnicodeString(&un, &want, TRUE)) return (ULONG64)e.DllBase;
+                if (RtlEqualUnicodeString(&un, &want, TRUE)) {
+                    if (verbose) Log("FMB: found %ws at %llx (guard=%d)", moduleName, (ULONG64)e.DllBase, guard);
+                    return (ULONG64)e.DllBase;
+                }
             }
         }
         cur = (ULONG64)e.InLoadOrderLinks.Flink;
     }
+    if (verbose) Log("FMB: not found guard=%d cur=%llx", guard, cur);
     return 0;
 }
 
@@ -443,7 +465,6 @@ static void ClearShared() {
 }
 
 // Буфер для пакетного чтения первого чанка сущностей (индексы 0..511)
-// Выделяется один раз в NonPagedPool, чтобы не перегружать стек ядра (лимит стека в ядре 24 КБ)
 static UCHAR* g_chunk0Cache = nullptr; // 512 * 112 = 57344 байт
 
 // Быстрое получение сущности: если она в чанке 0 (индексы 0..511), берем из уже прочитанного пакетного буфера!
@@ -463,7 +484,6 @@ static __forceinline ULONG64 FastEntityByIndex(ULONG64 es, ULONG64 chunk0Ptr, BO
     ULONG64 chunk = (c == 0) ? chunk0Ptr : 0;
     if (!chunk && (!RdQ(es + 0x10 + 8ULL * c, &chunk) || !chunk)) return 0;
 
-    // Читаем всю запись CEntityIdentity (первые 24 байта) за один раз вместо двух
     UCHAR entryBuf[24];
     if (!ReadCs2Memory(chunk + (ULONG64)subIdx * ENTITY_STRIDE, entryBuf, sizeof(entryBuf))) return 0;
 
@@ -476,45 +496,85 @@ static void Tick() {
     ResetTlb();
 
     static ULONG s_tickCount = 0;
+    static ULONG s_lastModuleAttempt = 0;   // NEW: тик последней попытки найти модуль
+    static bool  s_processLogged = false;   // NEW: чтобы не спамить "process found"
     ULONG tick = ++s_tickCount;
     bool logNow = ((tick % 500) == 0);
 
-    // Проверяем валидность базы только раз в 64 тика или если она еще не найдена
-    bool needRediscover = (!g_cs2Cr3 || !g_clientBase);
-    if (!needRediscover && (tick & 0x3F) == 0) {
-        USHORT mz = 0;
-        if (!ReadCs2Memory(g_clientBase, &mz, sizeof(mz)) || mz != 0x5A4D) {
-            needRediscover = true;
-        }
-    }
-
-    if (needRediscover) {
-        g_cs2Cr3 = 0;
-        g_clientBase = 0;
-        PEPROCESS p = FindCs2Process();
+    // =====================================================================
+    // 1) Поиск процесса — ТОЛЬКО если CR3 ещё не получен
+    //    При неудаче поиска модуля CR3 НЕ сбрасываем!
+    // =====================================================================
+    if (!g_cs2Cr3) {
+        HANDLE pid = nullptr;
+        PEPROCESS p = FindCs2Process(&pid);
         if (!p) {
             ClearShared();
             if (logNow) Log("cs2.exe not found");
             return;
         }
         g_cs2Cr3 = GetProcessCr3(p);
-        ResetTlb();
-        g_clientBase = FindModuleBase(p, L"client.dll");
+        g_cs2Pid = pid;
         ObDereferenceObject(p);
-        if (logNow) Log("re-discovered: cr3=%llx clientBase=%llx", g_cs2Cr3, g_clientBase);
-        if (!g_cs2Cr3 || !g_clientBase) {
+        ResetTlb();
+
+        if (!s_processLogged) {
+            Log("process found: pid=%p cr3=%llx", g_cs2Pid, g_cs2Cr3);
+            s_processLogged = true;
+        }
+        if (!g_cs2Cr3) {
             ClearShared();
             return;
         }
     }
 
+    // =====================================================================
+    // 2) Поиск/перепроверка модуля client.dll — раз в 64 тика (пока не найден)
+    //    или раз в 64 тика (пока найден, для проверки MZ)
+    // =====================================================================
+    bool needModuleCheck = (!g_clientBase) || ((tick - s_lastModuleAttempt) >= 64);
+
+    if (g_clientBase && (tick & 0x3F) == 0) {
+        USHORT mz = 0;
+        if (!ReadCs2Memory(g_clientBase, &mz, sizeof(mz)) || mz != 0x5A4D) {
+            // Модуль "пропал" (например, игра перезапустилась) — сбрасываем только его
+            Log("client.dll MZ check failed, resetting clientBase");
+            g_clientBase = 0;
+            needModuleCheck = true;
+        }
+    }
+
+    if (needModuleCheck && !g_clientBase) {
+        s_lastModuleAttempt = tick;
+        PEPROCESS p = nullptr;
+        if (NT_SUCCESS(PsLookupProcessByProcessId(g_cs2Pid, &p))) {
+            // verbose=true только когда ещё не нашли ни разу (иначе спам)
+            bool verbose = (g_clientBase == 0);
+            g_clientBase = FindModuleBase(p, L"client.dll", verbose);
+            ObDereferenceObject(p);
+        }
+        if (g_clientBase) {
+            Log("client.dll found: base=%llx", g_clientBase);
+        } else if (logNow || (tick - s_lastModuleAttempt) < 2) {
+            // Логируем неудачу либо раз в 500 тиков, либо сразу после попытки
+            Log("module rediscover: clientBase=0 (client.dll not loaded yet)");
+        }
+    }
+
+    if (!g_clientBase) {
+        ClearShared();
+        return;   // CR3 не трогаем — процесс найден, ждём загрузки client.dll
+    }
+
+    // =====================================================================
+    // 3) Чтение данных игры
+    // =====================================================================
     ULONG64 lp = 0, es = 0;
     RdQ(g_clientBase + OFF_dwLocalPlayerPawn, &lp);
     RdQ(g_clientBase + OFF_dwEntityList, &es);
     g_localPawn = lp;
     g_entitySystem = es;
 
-    // Пакетное чтение ViewMatrix (64 байта за один раз, копируем как ULONG без FPU)
     ULONG vmRaw[16] = {};
     if (ReadCs2Memory(g_clientBase + OFF_dwViewMatrix, vmRaw, sizeof(vmRaw)) && g_viewVa) {
         RtlCopyMemory(g_viewVa, vmRaw, sizeof(vmRaw));
@@ -528,11 +588,9 @@ static void Tick() {
     ULONG myTeam = 0;
     RdD(lp + OFF_m_iTeamNum, &myTeam);
 
-    // Пакетное чтение чанка 0 (содержит все контроллеры игроков 1..64 и большинство павнов)
     ULONG64 chunk0Ptr = 0;
     BOOLEAN chunk0Valid = FALSE;
     if (RdQ(es + 0x10, &chunk0Ptr) && chunk0Ptr && g_chunk0Cache) {
-        // Читаем первые 512 записей одним большим блоком (56 КБ)
         chunk0Valid = ReadCs2Memory(chunk0Ptr, g_chunk0Cache, 512 * ENTITY_STRIDE);
     }
 
@@ -555,7 +613,6 @@ static void Tick() {
         if (!pawn || pawn == lp) continue;
         ++pawnOk;
 
-        // ПАКЕТНОЕ ЧТЕНИЕ ПАВНА: читаем одним куском [0x330 .. 0x3EB] (m_pGameSceneNode, m_iHealth, m_lifeState, m_iTeamNum)
         UCHAR pawnSlice[PAWN_BATCH_SIZE];
         if (!ReadCs2Memory(pawn + PAWN_BATCH_BASE, pawnSlice, sizeof(pawnSlice))) continue;
 
@@ -570,7 +627,6 @@ static void Tick() {
         ULONG64 bMat = 0;
         if (!RdQ(scene + OFF_m_modelState + 0x80, &bMat) || !bMat) continue;
 
-        // ПАКЕТНОЕ ЧТЕНИЕ КОСТЕЙ: все 24 кости (768 байт) за 1 обращение
         UCHAR rawBones[MAX_BONES * 0x20];
         if (!ReadCs2Memory(bMat, rawBones, sizeof(rawBones))) continue;
         ++boneOk;
@@ -606,12 +662,10 @@ static void Tick() {
 }
 
 static VOID WorkerThread(PVOID) {
-    // Повышаем приоритет рабочего потока для минимальной задержки обновления данных
     KeSetPriorityThread(KeGetCurrentThread(), LOW_REALTIME_PRIORITY);
 
     LARGE_INTEGER interval;
-    // 2 мс (-20 000 * 100 нс) -> ~500 Гц обновление памяти
-    interval.QuadPart = -20000LL;
+    interval.QuadPart = -20000LL; // 2 мс
 
     for (;;) {
         if (InterlockedCompareExchange(&g_stop, 0, 0)) break;
@@ -733,7 +787,8 @@ static VOID DriverUnloadFn(PDRIVER_OBJECT) {
 extern "C" NTSTATUS DriverEntry(PDRIVER_OBJECT drv, PUNICODE_STRING) {
     g_hSharedSection = nullptr; g_sharedSecObj = nullptr; g_sharedVa = nullptr;
     g_hViewSection   = nullptr; g_viewSecObj   = nullptr; g_viewVa   = nullptr;
-    g_cs2Cr3 = 0; g_clientBase = 0; g_localPawn = 0; g_entitySystem = 0;
+    g_cs2Cr3 = 0; g_clientBase = 0; g_cs2Pid = nullptr;
+    g_localPawn = 0; g_entitySystem = 0;
     g_stop = 0; g_workerThread = nullptr;
     g_logTick = 0; g_statReads = 0; g_statReadFails = 0;
     g_chunk0Cache = nullptr;
