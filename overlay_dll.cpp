@@ -309,8 +309,8 @@ static DWORD WINAPI AsyncDataWorkerThread(LPVOID) {
         // Атомарно публикуем готовый кадр для потока рендера
         writeIdx = g_readySnapIdx.exchange(writeIdx, std::memory_order_acq_rel);
 
-        // Спим 1 мс, чтобы не жечь 100% ядра, сохраняя частоту опроса ~500-1000 Гц
-        Sleep(1);
+        // Отдаём квант, но возвращаемся быстрее, чем Sleep(1) (~1-15 мс)
+        SwitchToThread();
     }
     return 0;
 }
