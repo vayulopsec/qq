@@ -224,6 +224,7 @@ static DWORD WINAPI AsyncDataWorkerThread(LPVOID) {
     float        vm[16];
     uint32_t     writeIdx = 0;
     LONG         lastProcessedSeq = -1;
+    int          spin = 0;
 
     while (g_run.load(std::memory_order_relaxed)) {
         SharedBlock* shm  = g_shm.load(std::memory_order_acquire);
@@ -234,18 +235,22 @@ static DWORD WINAPI AsyncDataWorkerThread(LPVOID) {
             continue;
         }
 
-        // Чтение с проверкой Seqlock
         LONG s1 = shm->hdr.seq;
         if (s1 & 1) {
             YieldProcessor();
             continue;
         }
 
-        // Если драйвер ещё не записал новый тик — не перезаписываем тройной буфер вхолостую!
         if (s1 == lastProcessedSeq) {
-            YieldProcessor();
+            if (++spin < 100) {
+                YieldProcessor();
+            } else {
+                spin = 0;
+                SwitchToThread();
+            }
             continue;
         }
+        spin = 0;
 
         std::atomic_thread_fence(std::memory_order_acquire);
 
@@ -318,7 +323,6 @@ static DWORD WINAPI AsyncDataWorkerThread(LPVOID) {
 
         snap.count = outCount;
 
-        // Публикуем новый снапшот в центр и забираем свободный центральный буфер
         uint32_t prev = g_sharedSnapState.exchange(writeIdx | 0x80u, std::memory_order_acq_rel);
         writeIdx = prev & 0x03u;
     }
