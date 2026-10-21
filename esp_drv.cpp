@@ -716,7 +716,7 @@ static void Tick() {
 }
 
 static VOID WorkerThread(PVOID) {
-    KeSetPriorityThread(KeGetCurrentThread(), NORMAL_PRIORITY);  // не REALTIME
+    KeSetPriorityThread(KeGetCurrentThread(), 8);   // 8 = NORMAL_PRIORITY в терминах ядра
 
     LARGE_INTEGER interval;
     interval.QuadPart = -5000LL; // 0.5 мс (при резолюции 0.5 мс)
