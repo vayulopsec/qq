@@ -47,7 +47,6 @@ constexpr ULONG64 OFF_m_pGameSceneNode  = 0x330ULL;
 constexpr ULONG64 OFF_m_iHealth         = 0x34CULL;
 constexpr ULONG64 OFF_m_lifeState       = 0x354ULL;
 constexpr ULONG64 OFF_m_iTeamNum        = 0x3E7ULL;
-constexpr ULONG64 OFF_m_bDormant        = 0x103ULL;
 constexpr ULONG64 OFF_m_modelState      = 0x140ULL;
 constexpr ULONG64 OFF_m_hPlayerPawn     = 0x92CULL;
 
@@ -623,11 +622,6 @@ static void Tick() {
             continue;
         }
 
-        UCHAR dormant = 0;
-        if (ReadCs2Memory(scene + OFF_m_bDormant, &dormant, sizeof(dormant)) && dormant != 0) {
-            if (g_prevEnts) g_prevEnts[slotIdx].valid = 0;
-            continue;
-        }
         ++aliveOk;
 
         ULONG64 bMat = 0;
@@ -713,7 +707,7 @@ static VOID WorkerThread(PVOID) {
     KeSetPriorityThread(KeGetCurrentThread(), 8);   // 8 = NORMAL_PRIORITY в терминах ядра
 
     LARGE_INTEGER interval;
-    interval.QuadPart = -5000LL; // 0.5 мс (при резолюции 0.5 мс)
+    interval.QuadPart = -20000LL;  // 2 мс = 500 Гц ровно
 
     for (;;) {
         if (InterlockedCompareExchange(&g_stop, 0, 0)) break;
@@ -880,7 +874,7 @@ extern "C" NTSTATUS DriverEntry(PDRIVER_OBJECT drv, PUNICODE_STRING) {
         return st;
     }
 
-    ULONG curRes = ExSetTimerResolution(5000, TRUE);
+    ULONG curRes = ExSetTimerResolution(10000, TRUE);  // 1 мс (не 0.5)
 
     KeInitializeEvent(&g_workerEvent, NotificationEvent, FALSE);
 
