@@ -32,12 +32,6 @@ extern "C" NTSTATUS ZwQuerySection(
     PSIZE_T ReturnLength
 );
 
-extern "C" NTSTATUS ZwSetTimerResolution(
-    ULONG DesiredResolution,
-    BOOLEAN SetResolution,
-    PULONG CurrentResolution
-);
-
 constexpr ULONG   POOL_TAG       = 'spSE';
 constexpr ULONG   MAX_ENTITIES   = 64;
 constexpr ULONG   MAX_BONES      = 24;
@@ -840,6 +834,11 @@ static VOID DriverUnloadFn(PDRIVER_OBJECT) {
         g_workerThread = nullptr;
     }
     DestroyShared();
+
+    // ВАЖНО: восстанавливаем стандартную частоту системного таймера.
+    // Если этого не сделать, после выгрузки драйвера таймер останется на 0.5 мс,
+    // что повышает энергопотребление всей системы (ноутбуки/батарея).
+    ExSetTimerResolution(0, FALSE);
 }
 
 extern "C" NTSTATUS DriverEntry(PDRIVER_OBJECT drv, PUNICODE_STRING) {
@@ -881,10 +880,7 @@ extern "C" NTSTATUS DriverEntry(PDRIVER_OBJECT drv, PUNICODE_STRING) {
         return st;
     }
 
-    // Поднимаем kernel timer resolution до 0.5 мс — иначе KeWaitForSingleObject
-    // квантуется 15.6 мс и получаем 64 Гц вместо 500.
-    ULONG curRes = 0;
-    ZwSetTimerResolution(5000, TRUE, &curRes);
+    ULONG curRes = ExSetTimerResolution(5000, TRUE);
 
     KeInitializeEvent(&g_workerEvent, NotificationEvent, FALSE);
 
