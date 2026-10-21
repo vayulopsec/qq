@@ -433,7 +433,7 @@ static ULONG64 FindModuleBase(PEPROCESS proc, PCWSTR moduleName, bool verbose) {
                 UNICODE_STRING un;
                 RtlInitUnicodeString(&un, n);
                 if (RtlEqualUnicodeString(&un, &want, TRUE)) {
-                    if (verbose) Log("FMB: found %ws at %llx (guard=%d)", moduleName, (ULONG64)e.DllBase, guard);
+                    if (verbose) Log("FMB: found at %llx (guard=%d)", (ULONG64)e.DllBase, guard);
                     return (ULONG64)e.DllBase;
                 }
             }
@@ -453,32 +453,22 @@ static void ClearShared() {
     InterlockedIncrement(&g_sharedVa->hdr.seq);
 }
 
-// Буфер для пакетного чтения первого чанка сущностей (индексы 0..511)
-static UCHAR* g_chunk0Cache = nullptr; // 512 * 112 = 57344 байт
+constexpr ULONG CACHED_CHUNKS = 4; // индексы 0..2047
+static UCHAR* g_chunkCache = nullptr; // CACHED_CHUNKS * 512 * 112 = 224 КБ
 
-// Быстрое получение сущности: если она в чанке 0 (индексы 0..511), берем из уже прочитанного пакетного буфера!
-static __forceinline ULONG64 FastEntityByIndex(ULONG64 es, ULONG64 chunk0Ptr, BOOLEAN chunk0Valid, ULONG idx) {
-    if (!es || idx > 0x7FFE) return 0;
+static __forceinline ULONG64 FastEntityByIndex(const ULONG64* chunkPtrs,
+                                                const BOOLEAN* chunkValid,
+                                                ULONG idx) {
+    if (idx > 0x7FFE) return 0;
     ULONG c = idx >> 9;
     ULONG subIdx = idx & 0x1FF;
-
-    if (c == 0 && chunk0Valid && g_chunk0Cache) {
-        const UCHAR* entryPtr = g_chunk0Cache + (SIZE_T)subIdx * ENTITY_STRIDE;
-        ULONG ident = *(const ULONG*)(entryPtr + 0x10);
-        if ((ident & 0x7FFF) != idx) return 0;
-        return *(const ULONG64*)entryPtr;
-    }
-
-    if (c > 0x3F) return 0;
-    ULONG64 chunk = (c == 0) ? chunk0Ptr : 0;
-    if (!chunk && (!RdQ(es + 0x10 + 8ULL * c, &chunk) || !chunk)) return 0;
-
-    UCHAR entryBuf[24];
-    if (!ReadCs2Memory(chunk + (ULONG64)subIdx * ENTITY_STRIDE, entryBuf, sizeof(entryBuf))) return 0;
-
-    ULONG ident = *(ULONG*)(entryBuf + 0x10);
+    if (c >= CACHED_CHUNKS) return 0;
+    if (!chunkValid[c] || !g_chunkCache) return 0;
+    const UCHAR* entryPtr = g_chunkCache + (SIZE_T)c * 512 * ENTITY_STRIDE
+                          + (SIZE_T)subIdx * ENTITY_STRIDE;
+    ULONG ident = *(const ULONG*)(entryPtr + 0x10);
     if ((ident & 0x7FFF) != idx) return 0;
-    return *(ULONG64*)entryBuf;
+    return *(const ULONG64*)entryPtr;
 }
 
 static void Tick() {
@@ -523,13 +513,18 @@ static void Tick() {
     // =====================================================================
     bool needModuleCheck = (!g_clientBase) || ((tick - s_lastModuleAttempt) >= 64);
 
+    static ULONG s_mzFailCount = 0;
     if (g_clientBase && (tick & 0x3F) == 0) {
         USHORT mz = 0;
         if (!ReadCs2Memory(g_clientBase, &mz, sizeof(mz)) || mz != 0x5A4D) {
-            // Модуль "пропал" (например, игра перезапустилась) — сбрасываем только его
-            Log("client.dll MZ check failed, resetting clientBase");
-            g_clientBase = 0;
-            needModuleCheck = true;
+            if (++s_mzFailCount >= 3) {
+                s_mzFailCount = 0;
+                Log("client.dll MZ check failed 3x, resetting clientBase");
+                g_clientBase = 0;
+                needModuleCheck = true;
+            }
+        } else {
+            s_mzFailCount = 0;
         }
     }
 
@@ -577,10 +572,17 @@ static void Tick() {
     ULONG myTeam = 0;
     RdD(lp + OFF_m_iTeamNum, &myTeam);
 
-    ULONG64 chunk0Ptr = 0;
-    BOOLEAN chunk0Valid = FALSE;
-    if (RdQ(es + 0x10, &chunk0Ptr) && chunk0Ptr && g_chunk0Cache) {
-        chunk0Valid = ReadCs2Memory(chunk0Ptr, g_chunk0Cache, 512 * ENTITY_STRIDE);
+    ULONG64 chunkPtrs[CACHED_CHUNKS]   = {};
+    BOOLEAN chunkValid[CACHED_CHUNKS]  = {};
+    if (g_chunkCache) {
+        for (ULONG c = 0; c < CACHED_CHUNKS; ++c) {
+            if (RdQ(es + 0x10 + 8ULL * c, &chunkPtrs[c]) && chunkPtrs[c]) {
+                chunkValid[c] = ReadCs2Memory(
+                    chunkPtrs[c],
+                    g_chunkCache + (SIZE_T)c * 512 * ENTITY_STRIDE,
+                    512 * ENTITY_STRIDE);
+            }
+        }
     }
 
     if (g_sharedVa) {
@@ -591,14 +593,14 @@ static void Tick() {
     ULONG out = 0, ctrlOk = 0, pawnOk = 0, aliveOk = 0, boneOk = 0;
 
     for (ULONG i = 1; i <= 64 && out < MAX_ENTITIES; ++i) {
-        ULONG64 ctrl = FastEntityByIndex(es, chunk0Ptr, chunk0Valid, i);
+        ULONG64 ctrl = FastEntityByIndex(chunkPtrs, chunkValid, i);
         if (!ctrl) continue;
         ++ctrlOk;
 
         ULONG hPawn = 0;
         if (!RdD(ctrl + OFF_m_hPlayerPawn, &hPawn) || !hPawn || hPawn == 0xFFFFFFFF) continue;
 
-        ULONG64 pawn = FastEntityByIndex(es, chunk0Ptr, chunk0Valid, hPawn & 0x7FFF);
+        ULONG64 pawn = FastEntityByIndex(chunkPtrs, chunkValid, hPawn & 0x7FFF);
         if (!pawn || pawn == lp) continue;
         ++pawnOk;
 
@@ -759,7 +761,7 @@ static void DestroyShared() {
     if (g_hViewSection)   { ZwClose(g_hViewSection);   g_hViewSection = nullptr; }
     UnmapSectionSystem((PVOID*)&g_sharedVa, &g_sharedSecObj);
     if (g_hSharedSection) { ZwClose(g_hSharedSection); g_hSharedSection = nullptr; }
-    if (g_chunk0Cache)    { ExFreePoolWithTag(g_chunk0Cache, POOL_TAG); g_chunk0Cache = nullptr; }
+    if (g_chunkCache)     { ExFreePoolWithTag(g_chunkCache, POOL_TAG); g_chunkCache = nullptr; }
 }
 
 static VOID DriverUnloadFn(PDRIVER_OBJECT) {
@@ -780,11 +782,12 @@ extern "C" NTSTATUS DriverEntry(PDRIVER_OBJECT drv, PUNICODE_STRING) {
     g_localPawn = 0; g_entitySystem = 0;
     g_stop = 0; g_workerThread = nullptr;
     g_logTick = 0; g_statReads = 0; g_statReadFails = 0;
-    g_chunk0Cache = nullptr;
+    g_chunkCache = nullptr;
     ResetTlb();
 
-    g_chunk0Cache = (UCHAR*)ExAllocatePool2(POOL_FLAG_NON_PAGED, 512 * ENTITY_STRIDE, POOL_TAG);
-    if (!g_chunk0Cache) return STATUS_INSUFFICIENT_RESOURCES;
+    g_chunkCache = (UCHAR*)ExAllocatePool2(POOL_FLAG_NON_PAGED,
+                                           CACHED_CHUNKS * 512 * ENTITY_STRIDE, POOL_TAG);
+    if (!g_chunkCache) return STATUS_INSUFFICIENT_RESOURCES;
 
     NTSTATUS st = CreateShared();
     if (!NT_SUCCESS(st)) {
@@ -810,7 +813,7 @@ extern "C" NTSTATUS DriverEntry(PDRIVER_OBJECT drv, PUNICODE_STRING) {
         return st;
     }
 
-    Log("DriverEntry ok (MmMapIoSpaceEx Cached + Batch Read): shared=%p view=%p", g_sharedVa, g_viewVa);
+    Log("DriverEntry ok (MmCopyMemory PHYSICAL + Batch Read): shared=%p view=%p", g_sharedVa, g_viewVa);
 
     if (drv) drv->DriverUnload = DriverUnloadFn;
     return STATUS_SUCCESS;
