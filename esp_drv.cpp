@@ -39,7 +39,7 @@ constexpr ULONG   MAX_LOGS       = 256;
 constexpr ULONG   LOG_LINE_MAX   = 128;
 constexpr ULONG   ENTITY_STRIDE  = 112; // 0x70
 
-// ---- CS2 offsets ----
+// ---- CS2 offsets (проверены по offsets_2.hpp и client_dll_2.hpp) ----
 constexpr ULONG64 OFF_dwEntityList      = 0x271A908ULL;
 constexpr ULONG64 OFF_dwLocalPlayerPawn = 0x2565718ULL;
 constexpr ULONG64 OFF_dwViewMatrix      = 0x256B020ULL;
@@ -47,12 +47,13 @@ constexpr ULONG64 OFF_m_pGameSceneNode  = 0x330ULL;
 constexpr ULONG64 OFF_m_iHealth         = 0x34CULL;
 constexpr ULONG64 OFF_m_lifeState       = 0x354ULL;
 constexpr ULONG64 OFF_m_iTeamNum        = 0x3E7ULL;
+constexpr ULONG64 OFF_m_bDormant        = 0x103ULL;
 constexpr ULONG64 OFF_m_modelState      = 0x140ULL;
 constexpr ULONG64 OFF_m_hPlayerPawn     = 0x92CULL;
 
-// Диапазон пакетного чтения павна: от 0x330 (m_pGameSceneNode) до 0x3E7 + 4 (m_iTeamNum)
+// Диапазон пакетного чтения павна: от 0x330 (m_pGameSceneNode) до 0x3E7 + 1 (m_iTeamNum)
 constexpr ULONG64 PAWN_BATCH_BASE       = OFF_m_pGameSceneNode;
-constexpr SIZE_T  PAWN_BATCH_SIZE       = (OFF_m_iTeamNum + sizeof(UCHAR)) - PAWN_BATCH_BASE; // 0xBB байт
+constexpr SIZE_T  PAWN_BATCH_SIZE       = (OFF_m_iTeamNum + sizeof(UCHAR)) - PAWN_BATCH_BASE; // 0xB8 байт
 
 constexpr ULONG64 PHYS_MASK_4K          = 0x000FFFFFFFFFF000ULL;
 constexpr ULONG64 PHYS_MASK_2M          = 0x000FFFFFFFE00000ULL;
@@ -105,7 +106,7 @@ static ULONG*        g_viewVa         = nullptr;
 
 static ULONG64       g_cs2Cr3         = 0;
 static ULONG64       g_clientBase     = 0;
-static HANDLE        g_cs2Pid         = nullptr;   // NEW: сохранённый PID cs2.exe
+static HANDLE        g_cs2Pid         = nullptr;
 static ULONG64       g_localPawn      = 0;
 static ULONG64       g_entitySystem   = 0;
 static volatile LONG g_stop           = 0;
@@ -282,7 +283,6 @@ static __forceinline ULONG64 VirtualToPhysical(ULONG64 cr3, ULONG64 va) {
     return physPage + (va & 0xFFFULL);
 }
 
-// Пакетное чтение виртуальной памяти (объединяет смежные физические страницы в один MmMapIoSpaceEx)
 static BOOLEAN ReadCs2Memory(ULONG64 va, PVOID buf, SIZE_T size) {
     if (!g_cs2Cr3 || !va || !buf || !size) return FALSE;
     PUCHAR out = (PUCHAR)buf;
@@ -336,7 +336,6 @@ typedef struct _SYSTEM_PROCESS_INFO {
     LARGE_INTEGER WriteTransferCount; LARGE_INTEGER OtherTransferCount;
 } SYSTEM_PROCESS_INFO, *PSYSTEM_PROCESS_INFO;
 
-// Возвращает PEPROCESS и (опционально) PID
 static PEPROCESS FindCs2Process(HANDLE* outPid = nullptr) {
     ULONG size = 0x20000;
     PVOID buf = nullptr;
@@ -377,7 +376,6 @@ static PEPROCESS FindCs2Process(HANDLE* outPid = nullptr) {
 }
 
 static __forceinline ULONG64 GetProcessCr3(PEPROCESS p) {
-    // Offset подтверждён через dt nt!_KPROCESS: +0x028 DirectoryTableBase
     return *(ULONG64*)((PUCHAR)p + 0x28);
 }
 
@@ -387,7 +385,6 @@ typedef struct _LDR_ENTRY_OFF {
     UNICODE_STRING FullDllName; UNICODE_STRING BaseDllName;
 } LDR_ENTRY_OFF;
 
-// verbose=true — выводит диагностику (используется только при первом поиске модуля)
 static ULONG64 FindModuleBase(PEPROCESS proc, PCWSTR moduleName, bool verbose) {
     UNICODE_STRING fnName;
     RtlInitUnicodeString(&fnName, L"PsGetProcessPeb");
@@ -454,9 +451,11 @@ static void ClearShared() {
 }
 
 constexpr ULONG CACHED_CHUNKS = 4; // индексы 0..2047
-static UCHAR* g_chunkCache = nullptr; // CACHED_CHUNKS * 512 * 112 = 224 КБ
-static UCHAR* g_bonesScratch = nullptr; // MAX_BONES * 0x20 = 768 байт
-static UCHAR* g_pawnScratch = nullptr;  // PAWN_BATCH_SIZE = 0xBB байт
+static UCHAR*         g_chunkCache   = nullptr; // CACHED_CHUNKS * 512 * 112 = 224 КБ
+static UCHAR*         g_bonesScratch = nullptr; // MAX_BONES * 0x20 = 768 байт
+static UCHAR*         g_pawnScratch  = nullptr; // PAWN_BATCH_SIZE = 0xB8 байт
+static SHARED_ENTITY* g_localEnts    = nullptr; // Сборка текущего тика (вне Seqlock)
+static SHARED_ENTITY* g_prevEnts     = nullptr; // Кэш костей по слоту игрока (1..64) на случай промаха чтения
 
 static __forceinline ULONG64 FastEntityByIndex(const ULONG64* chunkPtrs,
                                                 const BOOLEAN* chunkValid,
@@ -477,15 +476,13 @@ static void Tick() {
     ResetTlb();
 
     static ULONG s_tickCount = 0;
-    static ULONG s_lastModuleAttempt = 0;   // NEW: тик последней попытки найти модуль
-    static bool  s_processLogged = false;   // NEW: чтобы не спамить "process found"
+    static ULONG s_lastModuleAttempt = 0;
+    static bool  s_processLogged = false;
+    static ULONG s_emptyGraceTicks = 0;
     ULONG tick = ++s_tickCount;
     bool logNow = ((tick % 500) == 0);
 
-    // =====================================================================
-    // 1) Поиск процесса — ТОЛЬКО если CR3 ещё не получен
-    //    При неудаче поиска модуля CR3 НЕ сбрасываем!
-    // =====================================================================
+    // 1) Поиск процесса
     if (!g_cs2Cr3) {
         HANDLE pid = nullptr;
         PEPROCESS p = FindCs2Process(&pid);
@@ -509,10 +506,7 @@ static void Tick() {
         }
     }
 
-    // =====================================================================
-    // 2) Поиск/перепроверка модуля client.dll — раз в 64 тика (пока не найден)
-    //    или раз в 64 тика (пока найден, для проверки MZ)
-    // =====================================================================
+    // 2) Поиск/перепроверка модуля client.dll
     bool needModuleCheck = (!g_clientBase) || ((tick - s_lastModuleAttempt) >= 64);
 
     static ULONG s_mzFailCount = 0;
@@ -535,7 +529,6 @@ static void Tick() {
         s_lastModuleAttempt = tick;
         PEPROCESS p = nullptr;
         if (NT_SUCCESS(PsLookupProcessByProcessId(g_cs2Pid, &p))) {
-            // verbose=true только когда ещё не нашли ни разу (иначе спам)
             bool verbose = (g_clientBase == 0);
             g_clientBase = FindModuleBase(p, L"client.dll", verbose);
             ObDereferenceObject(p);
@@ -543,19 +536,16 @@ static void Tick() {
         if (g_clientBase) {
             Log("client.dll found: base=%llx", g_clientBase);
         } else if (logNow || (tick - s_lastModuleAttempt) < 2) {
-            // Логируем неудачу либо раз в 500 тиков, либо сразу после попытки
             Log("module rediscover: clientBase=0 (client.dll not loaded yet)");
         }
     }
 
     if (!g_clientBase) {
         ClearShared();
-        return;   // CR3 не трогаем — процесс найден, ждём загрузки client.dll
+        return;
     }
 
-    // =====================================================================
-    // 3) Чтение данных игры
-    // =====================================================================
+    // 3) Чтение данных игры (полностью ВНЕ Seqlock)
     ULONG64 lp = 0, es = 0;
     RdQ(g_clientBase + OFF_dwLocalPlayerPawn, &lp);
     RdQ(g_clientBase + OFF_dwEntityList, &es);
@@ -563,12 +553,12 @@ static void Tick() {
     g_entitySystem = es;
 
     ULONG vmRaw[16] = {};
-    if (ReadCs2Memory(g_clientBase + OFF_dwViewMatrix, vmRaw, sizeof(vmRaw)) && g_viewVa) {
-        RtlCopyMemory(g_viewVa, vmRaw, sizeof(vmRaw));
-    }
+    BOOLEAN vmOk = ReadCs2Memory(g_clientBase + OFF_dwViewMatrix, vmRaw, sizeof(vmRaw));
 
     if (!lp || !es) {
-        ClearShared();
+        if (++s_emptyGraceTicks >= 8) {
+            ClearShared();
+        }
         return;
     }
 
@@ -588,14 +578,10 @@ static void Tick() {
         }
     }
 
-    if (g_sharedVa) {
-        InterlockedIncrement(&g_sharedVa->hdr.seq);
-        KeMemoryBarrier();
-    }
-
     ULONG out = 0, ctrlOk = 0, pawnOk = 0, aliveOk = 0, boneOk = 0;
 
     for (ULONG i = 1; i <= 64 && out < MAX_ENTITIES; ++i) {
+        ULONG slotIdx = i - 1;
         ULONG64 ctrl = FastEntityByIndex(chunkPtrs, chunkValid, i);
         if (!ctrl) continue;
         ++ctrlOk;
@@ -615,18 +601,33 @@ static void Tick() {
         UCHAR   ls    = *(UCHAR*)  (g_pawnScratch + (OFF_m_lifeState      - PAWN_BATCH_BASE));
         UCHAR   team  = *(UCHAR*)  (g_pawnScratch + (OFF_m_iTeamNum       - PAWN_BATCH_BASE));
 
-        if (hp <= 0 || hp > 200 || ls != 0 || team == myTeam || !scene) continue;
+        if (hp <= 0 || hp > 200 || ls != 0 || team == myTeam || !scene) {
+            if (g_prevEnts) g_prevEnts[slotIdx].valid = 0;
+            continue;
+        }
+
+        UCHAR dormant = 0;
+        if (ReadCs2Memory(scene + OFF_m_bDormant, &dormant, sizeof(dormant)) && dormant != 0) {
+            if (g_prevEnts) g_prevEnts[slotIdx].valid = 0;
+            continue;
+        }
         ++aliveOk;
 
         ULONG64 bMat = 0;
-        if (!RdQ(scene + OFF_m_modelState + 0x80, &bMat) || !bMat) continue;
+        bool bonesReadSuccess = false;
+        if (RdQ(scene + OFF_m_modelState + 0x80, &bMat) && bMat && g_bonesScratch) {
+            if (ReadCs2Memory(bMat, g_bonesScratch, MAX_BONES * 0x20)) {
+                // Проверяем, что кость головы (индекс 6 или 7) не нулевая
+                const ULONG* headBone = (const ULONG*)(g_bonesScratch + (SIZE_T)6 * 0x20);
+                if (headBone[0] != 0 || headBone[1] != 0 || headBone[2] != 0) {
+                    bonesReadSuccess = true;
+                }
+            }
+        }
 
-        if (!g_bonesScratch) continue;
-        if (!ReadCs2Memory(bMat, g_bonesScratch, MAX_BONES * 0x20)) continue;
-        ++boneOk;
-
-        if (g_sharedVa) {
-            SHARED_ENTITY& dst = g_sharedVa->ents[out];
+        if (bonesReadSuccess && g_localEnts) {
+            ++boneOk;
+            SHARED_ENTITY& dst = g_localEnts[out];
             dst.valid = 1;
             dst.hp    = hp;
             dst.team  = (int)team;
@@ -637,13 +638,49 @@ static void Tick() {
                 dst.bones[b].yBits = srcBone[1];
                 dst.bones[b].zBits = srcBone[2];
             }
+            if (g_prevEnts) {
+                RtlCopyMemory(&g_prevEnts[slotIdx], &dst, sizeof(SHARED_ENTITY));
+            }
+            ++out;
+        } else if (g_prevEnts && g_prevEnts[slotIdx].valid && g_localEnts) {
+            // Если на этом тике чтение костей сорвалось, используем кэш прошлого тика для этого слота
+            SHARED_ENTITY& dst = g_localEnts[out];
+            RtlCopyMemory(&dst, &g_prevEnts[slotIdx], sizeof(SHARED_ENTITY));
+            dst.hp   = hp;
+            dst.team = (int)team;
+            ++out;
         }
-        ++out;
     }
 
-    if (g_sharedVa) {
+    if (out == 0) {
+        if (++s_emptyGraceTicks < 8) {
+            if (vmOk && g_viewVa && g_sharedVa) {
+                InterlockedIncrement(&g_sharedVa->hdr.seq);
+                KeMemoryBarrier();
+                RtlCopyMemory(g_viewVa, vmRaw, sizeof(vmRaw));
+                KeMemoryBarrier();
+                InterlockedIncrement(&g_sharedVa->hdr.seq);
+            }
+            return;
+        }
+    } else {
+        s_emptyGraceTicks = 0;
+    }
+
+    // 4) Мгновенное копирование готового буфера под Seqlock
+    if (g_sharedVa && g_localEnts) {
+        InterlockedIncrement(&g_sharedVa->hdr.seq);
+        KeMemoryBarrier();
+
+        if (vmOk && g_viewVa) {
+            RtlCopyMemory(g_viewVa, vmRaw, sizeof(vmRaw));
+        }
+        if (out > 0) {
+            RtlCopyMemory(g_sharedVa->ents, g_localEnts, (SIZE_T)out * sizeof(SHARED_ENTITY));
+        }
         g_sharedVa->hdr.entityCount = out;
         g_sharedVa->hdr.version = 1;
+
         KeMemoryBarrier();
         InterlockedIncrement(&g_sharedVa->hdr.seq);
     }
@@ -767,6 +804,8 @@ static void DestroyShared() {
     if (g_chunkCache)     { ExFreePoolWithTag(g_chunkCache, POOL_TAG); g_chunkCache = nullptr; }
     if (g_bonesScratch)   { ExFreePoolWithTag(g_bonesScratch, POOL_TAG); g_bonesScratch = nullptr; }
     if (g_pawnScratch)    { ExFreePoolWithTag(g_pawnScratch, POOL_TAG); g_pawnScratch = nullptr; }
+    if (g_localEnts)      { ExFreePoolWithTag(g_localEnts, POOL_TAG); g_localEnts = nullptr; }
+    if (g_prevEnts)       { ExFreePoolWithTag(g_prevEnts, POOL_TAG); g_prevEnts = nullptr; }
 }
 
 static VOID DriverUnloadFn(PDRIVER_OBJECT) {
@@ -790,6 +829,8 @@ extern "C" NTSTATUS DriverEntry(PDRIVER_OBJECT drv, PUNICODE_STRING) {
     g_chunkCache = nullptr;
     g_bonesScratch = nullptr;
     g_pawnScratch = nullptr;
+    g_localEnts = nullptr;
+    g_prevEnts = nullptr;
     ResetTlb();
 
     g_chunkCache = (UCHAR*)ExAllocatePool2(POOL_FLAG_NON_PAGED,
@@ -801,6 +842,15 @@ extern "C" NTSTATUS DriverEntry(PDRIVER_OBJECT drv, PUNICODE_STRING) {
 
     g_pawnScratch = (UCHAR*)ExAllocatePool2(POOL_FLAG_NON_PAGED, PAWN_BATCH_SIZE, POOL_TAG);
     if (!g_pawnScratch) { DestroyShared(); return STATUS_INSUFFICIENT_RESOURCES; }
+
+    g_localEnts = (SHARED_ENTITY*)ExAllocatePool2(POOL_FLAG_NON_PAGED,
+                                                  sizeof(SHARED_ENTITY) * MAX_ENTITIES, POOL_TAG);
+    if (!g_localEnts) { DestroyShared(); return STATUS_INSUFFICIENT_RESOURCES; }
+
+    g_prevEnts = (SHARED_ENTITY*)ExAllocatePool2(POOL_FLAG_NON_PAGED,
+                                                 sizeof(SHARED_ENTITY) * MAX_ENTITIES, POOL_TAG);
+    if (!g_prevEnts) { DestroyShared(); return STATUS_INSUFFICIENT_RESOURCES; }
+    RtlZeroMemory(g_prevEnts, sizeof(SHARED_ENTITY) * MAX_ENTITIES);
 
     NTSTATUS st = CreateShared();
     if (!NT_SUCCESS(st)) {
