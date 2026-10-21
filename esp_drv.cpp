@@ -616,6 +616,7 @@ static void Tick() {
         UCHAR   team  = *(UCHAR*)  (g_pawnScratch + (OFF_m_iTeamNum       - PAWN_BATCH_BASE));
 
         if (hp <= 0 || hp > 200 || ls != 0 || team == myTeam || !scene) continue;
+        ++aliveOk;
 
         ULONG64 bMat = 0;
         if (!RdQ(scene + OFF_m_modelState + 0x80, &bMat) || !bMat) continue;
