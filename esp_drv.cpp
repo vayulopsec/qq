@@ -455,6 +455,7 @@ static void ClearShared() {
 
 constexpr ULONG CACHED_CHUNKS = 4; // индексы 0..2047
 static UCHAR* g_chunkCache = nullptr; // CACHED_CHUNKS * 512 * 112 = 224 КБ
+static UCHAR* g_bonesScratch = nullptr; // MAX_BONES * 0x20 = 768 байт
 
 static __forceinline ULONG64 FastEntityByIndex(const ULONG64* chunkPtrs,
                                                 const BOOLEAN* chunkValid,
@@ -618,8 +619,8 @@ static void Tick() {
         ULONG64 bMat = 0;
         if (!RdQ(scene + OFF_m_modelState + 0x80, &bMat) || !bMat) continue;
 
-        UCHAR rawBones[MAX_BONES * 0x20];
-        if (!ReadCs2Memory(bMat, rawBones, sizeof(rawBones))) continue;
+        if (!g_bonesScratch) continue;
+        if (!ReadCs2Memory(bMat, g_bonesScratch, MAX_BONES * 0x20)) continue;
         ++boneOk;
 
         if (g_sharedVa) {
@@ -629,7 +630,7 @@ static void Tick() {
             dst.team  = (int)team;
             dst.pad0  = 0;
             for (ULONG b = 0; b < MAX_BONES; ++b) {
-                const ULONG* srcBone = (const ULONG*)(rawBones + (SIZE_T)b * 0x20);
+                const ULONG* srcBone = (const ULONG*)(g_bonesScratch + (SIZE_T)b * 0x20);
                 dst.bones[b].xBits = srcBone[0];
                 dst.bones[b].yBits = srcBone[1];
                 dst.bones[b].zBits = srcBone[2];
@@ -762,6 +763,7 @@ static void DestroyShared() {
     UnmapSectionSystem((PVOID*)&g_sharedVa, &g_sharedSecObj);
     if (g_hSharedSection) { ZwClose(g_hSharedSection); g_hSharedSection = nullptr; }
     if (g_chunkCache)     { ExFreePoolWithTag(g_chunkCache, POOL_TAG); g_chunkCache = nullptr; }
+    if (g_bonesScratch)   { ExFreePoolWithTag(g_bonesScratch, POOL_TAG); g_bonesScratch = nullptr; }
 }
 
 static VOID DriverUnloadFn(PDRIVER_OBJECT) {
@@ -783,11 +785,15 @@ extern "C" NTSTATUS DriverEntry(PDRIVER_OBJECT drv, PUNICODE_STRING) {
     g_stop = 0; g_workerThread = nullptr;
     g_logTick = 0; g_statReads = 0; g_statReadFails = 0;
     g_chunkCache = nullptr;
+    g_bonesScratch = nullptr;
     ResetTlb();
 
     g_chunkCache = (UCHAR*)ExAllocatePool2(POOL_FLAG_NON_PAGED,
                                            CACHED_CHUNKS * 512 * ENTITY_STRIDE, POOL_TAG);
     if (!g_chunkCache) return STATUS_INSUFFICIENT_RESOURCES;
+
+    g_bonesScratch = (UCHAR*)ExAllocatePool2(POOL_FLAG_NON_PAGED, MAX_BONES * 0x20, POOL_TAG);
+    if (!g_bonesScratch) { DestroyShared(); return STATUS_INSUFFICIENT_RESOURCES; }
 
     NTSTATUS st = CreateShared();
     if (!NT_SUCCESS(st)) {
