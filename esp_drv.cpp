@@ -32,6 +32,12 @@ extern "C" NTSTATUS ZwQuerySection(
     PSIZE_T ReturnLength
 );
 
+extern "C" NTSTATUS ZwSetTimerResolution(
+    ULONG DesiredResolution,
+    BOOLEAN SetResolution,
+    PULONG CurrentResolution
+);
+
 constexpr ULONG   POOL_TAG       = 'spSE';
 constexpr ULONG   MAX_ENTITIES   = 64;
 constexpr ULONG   MAX_BONES      = 24;
@@ -292,6 +298,8 @@ static BOOLEAN ReadCs2Memory(ULONG64 va, PVOID buf, SIZE_T size) {
         ULONG64 curVa = va + done;
         ULONG64 startPhys = VirtualToPhysical(g_cs2Cr3, curVa);
         if (!startPhys) {
+            g_tlb.pml4Valid   = FALSE;          // форсим перечитывание PML4
+            g_tlb.lastVaPage  = ~0ULL;
             InterlockedIncrement(&g_statReadFails);
             return FALSE;
         }
@@ -310,6 +318,8 @@ static BOOLEAN ReadCs2Memory(ULONG64 va, PVOID buf, SIZE_T size) {
         }
 
         if (!ReadPhysicalCached(startPhys, out + done, chunk)) {
+            g_tlb.pml4Valid   = FALSE;
+            g_tlb.lastVaPage  = ~0ULL;
             InterlockedIncrement(&g_statReadFails);
             return FALSE;
         }
@@ -376,7 +386,8 @@ static PEPROCESS FindCs2Process(HANDLE* outPid = nullptr) {
 }
 
 static __forceinline ULONG64 GetProcessCr3(PEPROCESS p) {
-    return *(ULONG64*)((PUCHAR)p + 0x28);
+    ULONG64 cr3 = *(ULONG64*)((PUCHAR)p + 0x28);
+    return cr3 & PHYS_MASK_4K;   // срезаем PCID/флаги
 }
 
 typedef struct _LDR_ENTRY_OFF {
@@ -415,7 +426,7 @@ static ULONG64 FindModuleBase(PEPROCESS proc, PCWSTR moduleName, bool verbose) {
     if (verbose) Log("FMB: head=%llx firstCur=%llx", head, cur);
 
     int guard = 0;
-    for (; guard < 512 && cur && cur != head; ++guard) {
+    for (; guard < 2048 && cur && cur != head; ++guard) {
         LDR_ENTRY_OFF e = {};
         if (!ReadCs2Memory(cur, &e, sizeof(e))) {
             if (verbose) Log("FMB: entry read fail cur=%llx guard=%d", cur, guard);
@@ -430,12 +441,24 @@ static ULONG64 FindModuleBase(PEPROCESS proc, PCWSTR moduleName, bool verbose) {
                 UNICODE_STRING un;
                 RtlInitUnicodeString(&un, n);
                 if (RtlEqualUnicodeString(&un, &want, TRUE)) {
-                    if (verbose) Log("FMB: found at %llx (guard=%d)", (ULONG64)e.DllBase, guard);
-                    return (ULONG64)e.DllBase;
+                    // ВАЛИДАЦИЯ: по DllBase реально должен читаться "MZ"
+                    ULONG64 base = (ULONG64)e.DllBase;
+                    USHORT mz = 0;
+                    if (base && ReadCs2Memory(base, &mz, sizeof(mz)) && mz == 0x5A4D) {
+                        if (verbose) Log("FMB: found at %llx (guard=%d) MZ ok", base, guard);
+                        return base;
+                    }
+                    if (verbose) Log("FMB: candidate %llx guard=%d MZ fail, skip", base, guard);
+                    // не возвращаем — идём дальше по списку
                 }
             }
         }
         cur = (ULONG64)e.InLoadOrderLinks.Flink;
+        // ВАЛИДАЦИЯ Flink: должен быть в user-space и выровнен на 8
+        if (!cur || cur >= 0x7FFFFFFFFFFFULL || (cur & 7)) {
+            if (verbose) Log("FMB: bad Flink=%llx guard=%d, break", cur, guard);
+            break;
+        }
     }
     if (verbose) Log("FMB: not found guard=%d cur=%llx", guard, cur);
     return 0;
@@ -516,8 +539,8 @@ static void Tick() {
             if (++s_mzFailCount >= 3) {
                 s_mzFailCount = 0;
                 Log("client.dll MZ check failed 3x, resetting clientBase");
-                g_cs2Cr3 = 0;
-                g_clientBase = 0;
+                g_clientBase = 0;          // НЕ сбрасываем g_cs2Cr3
+                ResetTlb();
                 needModuleCheck = true;
             }
         } else {
@@ -693,10 +716,10 @@ static void Tick() {
 }
 
 static VOID WorkerThread(PVOID) {
-    KeSetPriorityThread(KeGetCurrentThread(), LOW_REALTIME_PRIORITY);
+    KeSetPriorityThread(KeGetCurrentThread(), NORMAL_PRIORITY);  // не REALTIME
 
     LARGE_INTEGER interval;
-    interval.QuadPart = -20000LL; // 2 мс
+    interval.QuadPart = -5000LL; // 0.5 мс (при резолюции 0.5 мс)
 
     for (;;) {
         if (InterlockedCompareExchange(&g_stop, 0, 0)) break;
@@ -858,6 +881,11 @@ extern "C" NTSTATUS DriverEntry(PDRIVER_OBJECT drv, PUNICODE_STRING) {
         return st;
     }
 
+    // Поднимаем kernel timer resolution до 0.5 мс — иначе KeWaitForSingleObject
+    // квантуется 15.6 мс и получаем 64 Гц вместо 500.
+    ULONG curRes = 0;
+    ZwSetTimerResolution(5000, TRUE, &curRes);
+
     KeInitializeEvent(&g_workerEvent, NotificationEvent, FALSE);
 
     HANDLE h = nullptr;
@@ -876,7 +904,8 @@ extern "C" NTSTATUS DriverEntry(PDRIVER_OBJECT drv, PUNICODE_STRING) {
         return st;
     }
 
-    Log("DriverEntry ok (MmCopyMemory PHYSICAL + Batch Read): shared=%p view=%p", g_sharedVa, g_viewVa);
+    Log("DriverEntry ok (MmCopyMemory PHYSICAL + Batch Read, res=%u): shared=%p view=%p",
+        curRes, g_sharedVa, g_viewVa);
 
     if (drv) drv->DriverUnload = DriverUnloadFn;
     return STATUS_SUCCESS;
