@@ -123,7 +123,7 @@ static void LogSelf(const char* fmt, ...) {
     AcquireSRWLockExclusive(&g_logLock);
     if (g_logFile) {
         fputs(line, g_logFile);
-        if (++g_logFlushCount >= 16) {
+        if (++g_logFlushCount >= 64) {
             g_logFlushCount = 0;
             fflush(g_logFile);
         }
@@ -140,7 +140,7 @@ static void LogKernelLine(const SharedLogEntry& le) {
     AcquireSRWLockExclusive(&g_logLock);
     if (g_logFile) {
         fputs(line, g_logFile);
-        if (++g_logFlushCount >= 16) {
+        if (++g_logFlushCount >= 64) {
             g_logFlushCount = 0;
             fflush(g_logFile);
         }
@@ -494,7 +494,7 @@ static DWORD WINAPI DiagThread(LPVOID) {
                         shm->hdr.seq, shm->hdr.entityCount, shm->hdr.version, shm->log.tail);
             }
         }
-        Sleep(1000);
+        Sleep(5000);
     }
     return 0;
 }
