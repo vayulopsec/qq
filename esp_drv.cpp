@@ -456,6 +456,7 @@ static void ClearShared() {
 constexpr ULONG CACHED_CHUNKS = 4; // индексы 0..2047
 static UCHAR* g_chunkCache = nullptr; // CACHED_CHUNKS * 512 * 112 = 224 КБ
 static UCHAR* g_bonesScratch = nullptr; // MAX_BONES * 0x20 = 768 байт
+static UCHAR* g_pawnScratch = nullptr;  // PAWN_BATCH_SIZE = 0xBB байт
 
 static __forceinline ULONG64 FastEntityByIndex(const ULONG64* chunkPtrs,
                                                 const BOOLEAN* chunkValid,
@@ -605,13 +606,13 @@ static void Tick() {
         if (!pawn || pawn == lp) continue;
         ++pawnOk;
 
-        UCHAR pawnSlice[PAWN_BATCH_SIZE];
-        if (!ReadCs2Memory(pawn + PAWN_BATCH_BASE, pawnSlice, sizeof(pawnSlice))) continue;
+        if (!g_pawnScratch) continue;
+        if (!ReadCs2Memory(pawn + PAWN_BATCH_BASE, g_pawnScratch, PAWN_BATCH_SIZE)) continue;
 
-        ULONG64 scene = *(ULONG64*)(pawnSlice + (OFF_m_pGameSceneNode - PAWN_BATCH_BASE));
-        int     hp    = *(int*)    (pawnSlice + (OFF_m_iHealth        - PAWN_BATCH_BASE));
-        ULONG   ls    = *(ULONG*)  (pawnSlice + (OFF_m_lifeState      - PAWN_BATCH_BASE));
-        ULONG   team  = *(ULONG*)  (pawnSlice + (OFF_m_iTeamNum       - PAWN_BATCH_BASE)) & 0xFF;
+        ULONG64 scene = *(ULONG64*)(g_pawnScratch + (OFF_m_pGameSceneNode - PAWN_BATCH_BASE));
+        int     hp    = *(int*)    (g_pawnScratch + (OFF_m_iHealth        - PAWN_BATCH_BASE));
+        ULONG   ls    = *(ULONG*)  (g_pawnScratch + (OFF_m_lifeState      - PAWN_BATCH_BASE));
+        ULONG   team  = *(ULONG*)  (g_pawnScratch + (OFF_m_iTeamNum       - PAWN_BATCH_BASE)) & 0xFF;
 
         if (hp <= 0 || hp > 200 || ls != 256 || team == (myTeam & 0xFF) || !scene) continue;
         ++aliveOk;
@@ -764,6 +765,7 @@ static void DestroyShared() {
     if (g_hSharedSection) { ZwClose(g_hSharedSection); g_hSharedSection = nullptr; }
     if (g_chunkCache)     { ExFreePoolWithTag(g_chunkCache, POOL_TAG); g_chunkCache = nullptr; }
     if (g_bonesScratch)   { ExFreePoolWithTag(g_bonesScratch, POOL_TAG); g_bonesScratch = nullptr; }
+    if (g_pawnScratch)    { ExFreePoolWithTag(g_pawnScratch, POOL_TAG); g_pawnScratch = nullptr; }
 }
 
 static VOID DriverUnloadFn(PDRIVER_OBJECT) {
@@ -786,6 +788,7 @@ extern "C" NTSTATUS DriverEntry(PDRIVER_OBJECT drv, PUNICODE_STRING) {
     g_logTick = 0; g_statReads = 0; g_statReadFails = 0;
     g_chunkCache = nullptr;
     g_bonesScratch = nullptr;
+    g_pawnScratch = nullptr;
     ResetTlb();
 
     g_chunkCache = (UCHAR*)ExAllocatePool2(POOL_FLAG_NON_PAGED,
@@ -794,6 +797,9 @@ extern "C" NTSTATUS DriverEntry(PDRIVER_OBJECT drv, PUNICODE_STRING) {
 
     g_bonesScratch = (UCHAR*)ExAllocatePool2(POOL_FLAG_NON_PAGED, MAX_BONES * 0x20, POOL_TAG);
     if (!g_bonesScratch) { DestroyShared(); return STATUS_INSUFFICIENT_RESOURCES; }
+
+    g_pawnScratch = (UCHAR*)ExAllocatePool2(POOL_FLAG_NON_PAGED, PAWN_BATCH_SIZE, POOL_TAG);
+    if (!g_pawnScratch) { DestroyShared(); return STATUS_INSUFFICIENT_RESOURCES; }
 
     NTSTATUS st = CreateShared();
     if (!NT_SUCCESS(st)) {
