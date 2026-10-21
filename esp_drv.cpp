@@ -220,31 +220,20 @@ static void Log(const char* fmt, ...) {
     LogRaw(buf);
 }
 
-// ---------------------------------------------------------------------------
-// Физическое чтение через MmMapIoSpaceEx (Кэшированное PAGE_READONLY = MmCached)
-// ---------------------------------------------------------------------------
 static __forceinline BOOLEAN ReadPhysicalCached(ULONG64 phys, PVOID buf, SIZE_T size) {
     if (!phys || !buf || !size) return FALSE;
+    MM_COPY_ADDRESS src;
     PHYSICAL_ADDRESS pa;
+    SIZE_T copied = 0;
     pa.QuadPart = (LONGLONG)phys;
-
-    PVOID mapped = MmMapIoSpaceEx(pa, size, PAGE_READONLY);
-    if (!mapped) return FALSE;
-
-    RtlCopyMemory(buf, mapped, size);
-    MmUnmapIoSpace(mapped, size);
-    return TRUE;
+    src.PhysicalAddress = pa;
+    NTSTATUS st = MmCopyMemory(buf, src, size, MM_COPY_MEMORY_PHYSICAL, &copied);
+    return NT_SUCCESS(st) && copied == size;
 }
 
 static __forceinline ULONG64 ReadPhysicalQword(ULONG64 phys) {
     ULONG64 v = 0;
-    PHYSICAL_ADDRESS pa;
-    pa.QuadPart = (LONGLONG)phys;
-    PVOID mapped = MmMapIoSpaceEx(pa, sizeof(ULONG64), PAGE_READONLY);
-    if (mapped) {
-        v = *(volatile ULONG64*)mapped;
-        MmUnmapIoSpace(mapped, sizeof(ULONG64));
-    }
+    ReadPhysicalCached(phys, &v, sizeof(v));
     return v;
 }
 
