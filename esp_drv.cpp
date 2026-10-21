@@ -52,7 +52,7 @@ constexpr ULONG64 OFF_m_hPlayerPawn     = 0x92CULL;
 
 // Диапазон пакетного чтения павна: от 0x330 (m_pGameSceneNode) до 0x3E7 + 4 (m_iTeamNum)
 constexpr ULONG64 PAWN_BATCH_BASE       = OFF_m_pGameSceneNode;
-constexpr SIZE_T  PAWN_BATCH_SIZE       = (OFF_m_iTeamNum + sizeof(ULONG)) - PAWN_BATCH_BASE; // 0xBB байт
+constexpr SIZE_T  PAWN_BATCH_SIZE       = (OFF_m_iTeamNum + sizeof(UCHAR)) - PAWN_BATCH_BASE; // 0xBB байт
 
 constexpr ULONG64 PHYS_MASK_4K          = 0x000FFFFFFFFFF000ULL;
 constexpr ULONG64 PHYS_MASK_2M          = 0x000FFFFFFFE00000ULL;
@@ -522,6 +522,7 @@ static void Tick() {
             if (++s_mzFailCount >= 3) {
                 s_mzFailCount = 0;
                 Log("client.dll MZ check failed 3x, resetting clientBase");
+                g_cs2Cr3 = 0;
                 g_clientBase = 0;
                 needModuleCheck = true;
             }
@@ -571,8 +572,8 @@ static void Tick() {
         return;
     }
 
-    ULONG myTeam = 0;
-    RdD(lp + OFF_m_iTeamNum, &myTeam);
+    UCHAR myTeam = 0;
+    ReadCs2Memory(lp + OFF_m_iTeamNum, &myTeam, sizeof(myTeam));
 
     ULONG64 chunkPtrs[CACHED_CHUNKS]   = {};
     BOOLEAN chunkValid[CACHED_CHUNKS]  = {};
@@ -611,11 +612,10 @@ static void Tick() {
 
         ULONG64 scene = *(ULONG64*)(g_pawnScratch + (OFF_m_pGameSceneNode - PAWN_BATCH_BASE));
         int     hp    = *(int*)    (g_pawnScratch + (OFF_m_iHealth        - PAWN_BATCH_BASE));
-        ULONG   ls    = *(ULONG*)  (g_pawnScratch + (OFF_m_lifeState      - PAWN_BATCH_BASE));
-        ULONG   team  = *(ULONG*)  (g_pawnScratch + (OFF_m_iTeamNum       - PAWN_BATCH_BASE)) & 0xFF;
+        UCHAR   ls    = *(UCHAR*)  (g_pawnScratch + (OFF_m_lifeState      - PAWN_BATCH_BASE));
+        UCHAR   team  = *(UCHAR*)  (g_pawnScratch + (OFF_m_iTeamNum       - PAWN_BATCH_BASE));
 
-        if (hp <= 0 || hp > 200 || ls != 256 || team == (myTeam & 0xFF) || !scene) continue;
-        ++aliveOk;
+        if (hp <= 0 || hp > 200 || ls != 0 || team == myTeam || !scene) continue;
 
         ULONG64 bMat = 0;
         if (!RdQ(scene + OFF_m_modelState + 0x80, &bMat) || !bMat) continue;
@@ -741,7 +741,7 @@ static NTSTATUS CreateShared() {
 
         g_sharedVa = (SHARED_BLOCK*)base;
         g_sharedVa->hdr.version = 1;
-        g_sharedVa->hdr.maxEntities = 256;
+        g_sharedVa->hdr.maxEntities = MAX_ENTITIES;   // 64
     }
 
     if (!g_viewVa) {
