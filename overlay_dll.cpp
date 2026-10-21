@@ -243,7 +243,7 @@ static DWORD WINAPI AsyncDataWorkerThread(LPVOID) {
 
         // Если драйвер ещё не записал новый тик — не перезаписываем тройной буфер вхолостую!
         if (s1 == lastProcessedSeq) {
-            Sleep(1);
+            YieldProcessor();
             continue;
         }
 
