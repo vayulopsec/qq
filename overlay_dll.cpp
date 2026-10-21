@@ -79,7 +79,11 @@ struct RenderSnapshot {
 };
 
 static RenderSnapshot        g_snapshots[3];
-static std::atomic<uint32_t> g_readySnapIdx{0};
+// Младшие 2 бита — индекс центрального буфера (0, 1 или 2).
+// Бит 0x80 — флаг наличия нового кадра от Worker'а.
+// Изначально: 0 — у Worker'а (writeIdx), 1 — в центре (g_sharedSnapState), 2 — у Render'а (g_readIdx).
+static std::atomic<uint32_t> g_sharedSnapState{1};
+static uint32_t              g_readIdx = 2;
 
 // ===========================================================================
 // Потокобезопасное логирование (SRWLOCK — быстрее CRITICAL_SECTION в C++20)
@@ -213,13 +217,13 @@ static __forceinline bool FastW2S(const float* __restrict m, float x, float y, f
     return true;
 }
 
-// Поток асинхронного чтения Shared Memory и просчета геометрии (разгружает Render Thread)
 static DWORD WINAPI AsyncDataWorkerThread(LPVOID) {
     SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_ABOVE_NORMAL);
 
     SharedEntity localEnts[64];
     float        vm[16];
-    uint32_t     writeIdx = 1;
+    uint32_t     writeIdx = 0;
+    LONG         lastProcessedSeq = -1;
 
     while (g_run.load(std::memory_order_relaxed)) {
         SharedBlock* shm  = g_shm.load(std::memory_order_acquire);
@@ -236,6 +240,13 @@ static DWORD WINAPI AsyncDataWorkerThread(LPVOID) {
             YieldProcessor();
             continue;
         }
+
+        // Если драйвер ещё не записал новый тик — не перезаписываем тройной буфер вхолостую!
+        if (s1 == lastProcessedSeq) {
+            Sleep(1);
+            continue;
+        }
+
         std::atomic_thread_fence(std::memory_order_acquire);
 
         ULONG n = shm->hdr.entityCount;
@@ -244,6 +255,7 @@ static DWORD WINAPI AsyncDataWorkerThread(LPVOID) {
             std::memcpy(localEnts, (const void*)shm->ents, n * sizeof(SharedEntity));
         }
         ULONG ver = shm->hdr.version;
+        std::memcpy(vm, (const void*)view, sizeof(vm));
 
         std::atomic_thread_fence(std::memory_order_acquire);
         LONG s2 = shm->hdr.seq;
@@ -252,7 +264,7 @@ static DWORD WINAPI AsyncDataWorkerThread(LPVOID) {
             continue;
         }
 
-        std::memcpy(vm, (const void*)view, sizeof(vm));
+        lastProcessedSeq = s2;
 
         const float cx = g_W.load(std::memory_order_relaxed) * 0.5f;
         const float cy = g_H.load(std::memory_order_relaxed) * 0.5f;
@@ -306,11 +318,9 @@ static DWORD WINAPI AsyncDataWorkerThread(LPVOID) {
 
         snap.count = outCount;
 
-        // Атомарно публикуем готовый кадр для потока рендера
-        writeIdx = g_readySnapIdx.exchange(writeIdx, std::memory_order_acq_rel);
-
-        // Отдаём квант, но возвращаемся быстрее, чем Sleep(1) (~1-15 мс)
-        SwitchToThread();
+        // Публикуем новый снапшот в центр и забираем свободный центральный буфер
+        uint32_t prev = g_sharedSnapState.exchange(writeIdx | 0x80u, std::memory_order_acq_rel);
+        writeIdx = prev & 0x03u;
     }
     return 0;
 }
@@ -349,7 +359,6 @@ static bool CreateDev(HWND h) {
     sd.BufferCount       = 2;
     sd.OutputWindow      = h;
     sd.Windowed          = TRUE;
-    // Flip-модель или Discard с поддержкой низкой задержки VSync
     sd.SwapEffect        = DXGI_SWAP_EFFECT_DISCARD;
     sd.Flags             = DXGI_SWAP_CHAIN_FLAG_ALLOW_MODE_SWITCH;
 
@@ -363,7 +372,6 @@ static bool CreateDev(HWND h) {
         return false;
     }
 
-    // Ограничиваем очередь кадров DXGI до 1 для минимального инпут-лага при включенном VSync
     IDXGIDevice1* dxgiDev = nullptr;
     if (SUCCEEDED(g_dev->QueryInterface(__uuidof(IDXGIDevice1), (void**)&dxgiDev)) && dxgiDev) {
         dxgiDev->SetMaximumFrameLatency(1);
@@ -405,8 +413,13 @@ static void DrawKernelLogs(ImDrawList* d) {
 }
 
 static void Render(ImDrawList* d) {
-    const uint32_t snapIdx = g_readySnapIdx.load(std::memory_order_acquire);
-    const RenderSnapshot& snap = g_snapshots[snapIdx];
+    // Забираем новый буфер из центра только если бит 0x80 выставлен Worker'ом
+    uint32_t state = g_sharedSnapState.load(std::memory_order_acquire);
+    if (state & 0x80u) {
+        uint32_t prev = g_sharedSnapState.exchange(g_readIdx, std::memory_order_acq_rel);
+        g_readIdx = prev & 0x03u;
+    }
+    const RenderSnapshot& snap = g_snapshots[g_readIdx];
 
     char statusLine[256];
     _snprintf_s(statusLine, sizeof(statusLine), _TRUNCATE,
@@ -553,8 +566,6 @@ static DWORD WINAPI OverlayThread(LPVOID) {
         g_ctx->ClearRenderTargetView(g_rtv, clr);
         ImGui_ImplDX11_RenderDrawData(ImGui::GetDrawData());
 
-        // Строгое ограничение FPS по VSync (SyncInterval = 1)
-        // Если окно свернуто или перекрыто (DXGI_STATUS_OCCLUDED), спим, чтобы не крутить цикл вхолостую
         HRESULT hr = g_sc->Present(1, 0);
         if (hr == DXGI_STATUS_OCCLUDED) {
             DwmFlush();
@@ -596,11 +607,9 @@ static DWORD WINAPI InitThread(LPVOID) {
         }
     }
 
-    // Запускаем фоновые рабочие потоки (диагностика + асинхронный математический воркер)
     CreateThread(nullptr, 0, DiagThread, nullptr, 0, nullptr);
     CreateThread(nullptr, 0, AsyncDataWorkerThread, nullptr, 0, nullptr);
 
-    // Запускаем основной поток рендера с VSync
     OverlayThread(nullptr);
     return 0;
 }
