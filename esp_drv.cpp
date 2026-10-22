@@ -92,7 +92,7 @@ struct SHARED_LOG {
 struct SHARED_BLOCK {
     SHARED_HEADER hdr;
     SHARED_LOG    log;
-    SHARED_ENTITY ents[256];
+    SHARED_ENTITY ents[MAX_ENTITIES];
 };
 #pragma pack(pop)
 
