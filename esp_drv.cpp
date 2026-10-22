@@ -58,6 +58,9 @@ constexpr ULONG64 PHYS_MASK_4K          = 0x000FFFFFFFFFF000ULL;
 constexpr ULONG64 PHYS_MASK_2M          = 0x000FFFFFFFE00000ULL;
 constexpr ULONG64 PHYS_MASK_1G          = 0x000FFFFFC0000000ULL;
 
+// Пользовательский VA не может быть >= 0x800000000000 (canonical верх)
+constexpr ULONG64 USER_VA_MAX           = 0x800000000000ULL;
+
 #pragma pack(push, 1)
 struct SHARED_BONE {
     ULONG xBits, yBits, zBits; // Храним как сырые 32-битные поля (float на стороне usermode)
@@ -115,6 +118,10 @@ static PKTHREAD      g_workerThread   = nullptr;
 static volatile LONG g_logTick        = 0;
 static volatile LONG g_statReads      = 0;
 static volatile LONG g_statReadFails  = 0;
+
+// ---- Состояние для отслеживания смены процесса/PEB ----
+static ULONG64       g_lastPeb          = 0;
+static bool          g_fmbVerboseLogged = false;
 
 // ---- Локальный кэш трансляции адресов (Direct-mapped TLB 256 + PML4) ----
 constexpr ULONG TLB_SIZE     = 256;
@@ -306,6 +313,10 @@ static __forceinline ULONG64 VirtualToPhysical(ULONG64 cr3, ULONG64 va) {
 
 static BOOLEAN ReadCs2Memory(ULONG64 va, PVOID buf, SIZE_T size) {
     if (!g_cs2Cr3 || !va || !buf || !size) return FALSE;
+    // Пользовательский VA: не должен быть в kernel-space и не должен переполняться
+    if (va >= USER_VA_MAX) return FALSE;
+    if (size > USER_VA_MAX || va + size < va || va + size > USER_VA_MAX) return FALSE;
+
     PUCHAR out = (PUCHAR)buf;
     SIZE_T done = 0;
 
@@ -403,6 +414,16 @@ static __forceinline ULONG64 GetProcessCr3(PEPROCESS p) {
     return cr3 & PHYS_MASK_4K;   // срезаем PCID/флаги
 }
 
+// Получить текущий PEB процесса через PsGetProcessPeb (или 0)
+static __forceinline ULONG64 GetProcessPeb(PEPROCESS p) {
+    UNICODE_STRING fnName;
+    RtlInitUnicodeString(&fnName, L"PsGetProcessPeb");
+    typedef PVOID(*fnPeb)(PEPROCESS);
+    fnPeb fn = (fnPeb)MmGetSystemRoutineAddress(&fnName);
+    if (!fn) return 0;
+    return (ULONG64)fn(p);
+}
+
 typedef struct _LDR_ENTRY_OFF {
     LIST_ENTRY InLoadOrderLinks; PVOID ExceptionTable; ULONG ExceptionTableSize; PVOID GpValue;
     PVOID NonPagedDebugInfo; PVOID DllBase; PVOID EntryPoint; ULONG SizeOfImage;
@@ -410,22 +431,29 @@ typedef struct _LDR_ENTRY_OFF {
 } LDR_ENTRY_OFF;
 
 static ULONG64 FindModuleBase(PEPROCESS proc, PCWSTR moduleName, bool verbose) {
-    UNICODE_STRING fnName;
-    RtlInitUnicodeString(&fnName, L"PsGetProcessPeb");
-    typedef PVOID(*fnPeb)(PEPROCESS);
-    fnPeb fn = (fnPeb)MmGetSystemRoutineAddress(&fnName);
-    if (!fn) { if (verbose) Log("FMB: PsGetProcessPeb not resolved"); return 0; }
-
-    ULONG64 peb = (ULONG64)fn(proc);
+    ULONG64 peb = GetProcessPeb(proc);
     if (verbose) Log("FMB: peb=%llx", peb);
     if (!peb) return 0;
+
+    // Sanity: PEB->BeingDebugged (offset 0x02) должен читаться, иначе CR3/трансляция врёт
+    UCHAR beingDebugged = 0;
+    if (!ReadCs2Memory(peb + 0x02, &beingDebugged, 1)) {
+        if (verbose) Log("FMB: PEB itself unreadable at %llx (CR3/translation broken)", peb);
+        return 0;
+    }
 
     UNICODE_STRING want;
     RtlInitUnicodeString(&want, moduleName);
 
     ULONG64 ldr = 0;
-    if (!RdQ(peb + 0x18, &ldr) || !ldr) {
-        if (verbose) Log("FMB: ldr read fail/null (client.dll not loaded yet?)");
+    BOOLEAN ldrOk = RdQ(peb + 0x18, &ldr);
+    if (!ldrOk) {
+        if (verbose) Log("FMB: ldr READ FAIL (translation broken) peb=%llx va=%llx",
+                         peb, peb + 0x18);
+        return 0;
+    }
+    if (!ldr) {
+        if (verbose) Log("FMB: ldr == NULL (PEB->Ldr not initialized) peb=%llx", peb);
         return 0;
     }
     if (verbose) Log("FMB: ldr=%llx", ldr);
@@ -438,14 +466,27 @@ static ULONG64 FindModuleBase(PEPROCESS proc, PCWSTR moduleName, bool verbose) {
     }
     if (verbose) Log("FMB: head=%llx firstCur=%llx", head, cur);
 
+    // Валидация firstCur: должен быть в user-space и выровнен на 8
+    if (!cur || cur >= USER_VA_MAX || (cur & 7)) {
+        if (verbose) Log("FMB: firstCur invalid=%llx", cur);
+        return 0;
+    }
+
     int guard = 0;
-    for (; guard < 2048 && cur && cur != head; ++guard) {
+    for (; guard < 512 && cur && cur != head; ++guard) {
         LDR_ENTRY_OFF e = {};
         if (!ReadCs2Memory(cur, &e, sizeof(e))) {
             if (verbose) Log("FMB: entry read fail cur=%llx guard=%d", cur, guard);
             return 0;
         }
-        if (e.BaseDllName.Buffer && e.BaseDllName.Length) {
+
+        // Сначала дешёвый MZ-чек по DllBase, только потом читаем BaseDllName
+        ULONG64 base = (ULONG64)e.DllBase;
+        USHORT mz = 0;
+        bool mzOk = base && base < USER_VA_MAX
+                    && ReadCs2Memory(base, &mz, sizeof(mz)) && mz == 0x5A4D;
+
+        if (mzOk && e.BaseDllName.Buffer && e.BaseDllName.Length) {
             WCHAR n[128] = {};
             USHORT len = e.BaseDllName.Length;
             if (len > sizeof(n) - sizeof(WCHAR)) len = sizeof(n) - sizeof(WCHAR);
@@ -454,21 +495,15 @@ static ULONG64 FindModuleBase(PEPROCESS proc, PCWSTR moduleName, bool verbose) {
                 UNICODE_STRING un;
                 RtlInitUnicodeString(&un, n);
                 if (RtlEqualUnicodeString(&un, &want, TRUE)) {
-                    // ВАЛИДАЦИЯ: по DllBase реально должен читаться "MZ"
-                    ULONG64 base = (ULONG64)e.DllBase;
-                    USHORT mz = 0;
-                    if (base && ReadCs2Memory(base, &mz, sizeof(mz)) && mz == 0x5A4D) {
-                        if (verbose) Log("FMB: found at %llx (guard=%d) MZ ok", base, guard);
-                        return base;
-                    }
-                    if (verbose) Log("FMB: candidate %llx guard=%d MZ fail, skip", base, guard);
-                    // не возвращаем — идём дальше по списку
+                    if (verbose) Log("FMB: found at %llx (guard=%d) MZ ok", base, guard);
+                    return base;
                 }
             }
         }
+
         cur = (ULONG64)e.InLoadOrderLinks.Flink;
         // ВАЛИДАЦИЯ Flink: должен быть в user-space и выровнен на 8
-        if (!cur || cur >= 0x7FFFFFFFFFFFULL || (cur & 7)) {
+        if (!cur || cur >= USER_VA_MAX || (cur & 7)) {
             if (verbose) Log("FMB: bad Flink=%llx guard=%d, break", cur, guard);
             break;
         }
@@ -534,8 +569,38 @@ static void Tick() {
     static ULONG s_lastModuleAttempt = 0;
     static bool  s_processLogged = false;
     static ULONG s_emptyGraceTicks = 0;
+    static ULONG s_mzFailCount = 0;
     ULONG tick = ++s_tickCount;
-    bool logNow = ((tick % 2000) == 0);   // ~4 сек вместо 1 сек
+    bool logNow = ((tick % 2000) == 0);   // ~4 сек
+
+    // ---- ПРОВЕРКА ЖИВОСТИ ПРОЦЕССА И СМЕНЫ PEB/CR3 ----
+    if (g_cs2Pid) {
+        PEPROCESS p = nullptr;
+        if (!NT_SUCCESS(PsLookupProcessByProcessId(g_cs2Pid, &p))) {
+            Log("cs2.exe exited, full reset (pid=%p)", g_cs2Pid);
+            g_cs2Cr3 = 0; g_clientBase = 0; g_cs2Pid = nullptr;
+            g_lastPeb = 0; g_fmbVerboseLogged = false;
+            s_processLogged = false;
+            ResetTlbFull();
+            ClearShared();
+            return;
+        }
+
+        // PEB проверяем раз в 16 тиков (~32 мс)
+        if ((tick & 0xF) == 0) {
+            ULONG64 curPeb = GetProcessPeb(p);
+            if (curPeb && g_lastPeb && curPeb != g_lastPeb) {
+                Log("PEB changed %llx -> %llx, resetting CR3/TLB/module",
+                    g_lastPeb, curPeb);
+                g_clientBase = 0;
+                g_fmbVerboseLogged = false;
+                ResetTlbFull();
+                g_cs2Cr3 = GetProcessCr3(p);   // перечитываем CR3
+            }
+            if (curPeb) g_lastPeb = curPeb;
+        }
+        ObDereferenceObject(p);
+    }
 
     // 1) Поиск процесса
     if (!g_cs2Cr3) {
@@ -543,16 +608,18 @@ static void Tick() {
         PEPROCESS p = FindCs2Process(&pid);
         if (!p) {
             ClearShared();
-            if (logNow && (tick % 5000) == 0) Log("cs2.exe not found");   // раз в ~10 сек
+            if (logNow && (tick % 5000) == 0) Log("cs2.exe not found");
             return;
         }
         g_cs2Cr3 = GetProcessCr3(p);
         g_cs2Pid = pid;
+        g_lastPeb = GetProcessPeb(p);
         ObDereferenceObject(p);
         ResetTlbFull();
 
         if (!s_processLogged) {
-            Log("process found: pid=%p cr3=%llx", g_cs2Pid, g_cs2Cr3);
+            Log("process found: pid=%p cr3=%llx peb=%llx",
+                g_cs2Pid, g_cs2Cr3, g_lastPeb);
             s_processLogged = true;
         }
         if (!g_cs2Cr3) {
@@ -564,7 +631,6 @@ static void Tick() {
     // 2) Поиск/перепроверка модуля client.dll
     bool needModuleCheck = (!g_clientBase) || ((tick - s_lastModuleAttempt) >= 64);
 
-    static ULONG s_mzFailCount = 0;
     if (g_clientBase && (tick & 0x3F) == 0) {
         USHORT mz = 0;
         if (!ReadCs2Memory(g_clientBase, &mz, sizeof(mz)) || mz != 0x5A4D) {
@@ -572,6 +638,7 @@ static void Tick() {
                 s_mzFailCount = 0;
                 Log("client.dll MZ check failed 3x, resetting clientBase");
                 g_clientBase = 0;          // НЕ сбрасываем g_cs2Cr3
+                g_fmbVerboseLogged = false;
                 ResetTlbFull();
                 needModuleCheck = true;
             }
@@ -584,14 +651,22 @@ static void Tick() {
         s_lastModuleAttempt = tick;
         PEPROCESS p = nullptr;
         if (NT_SUCCESS(PsLookupProcessByProcessId(g_cs2Pid, &p))) {
-            bool verbose = (g_clientBase == 0);
+            // verbose ТОЛЬКО один раз на попытку
+            bool verbose = !g_fmbVerboseLogged;
             g_clientBase = FindModuleBase(p, L"client.dll", verbose);
             ObDereferenceObject(p);
         }
         if (g_clientBase) {
+            g_fmbVerboseLogged = true;   // нашли — больше не спамим
             Log("client.dll found: base=%llx", g_clientBase);
-        } else if ((tick % 5000) == 0) {
-            Log("module rediscover: clientBase=0 (client.dll not loaded yet)");
+        } else {
+            g_fmbVerboseLogged = true;   // попытка уже залогирована
+            // не нашли — инвалидируем PML4, чтобы следующая попытка перечитала
+            g_tlb.pml4Valid = FALSE;
+            g_tlb.pml4Age   = 0;
+            if ((tick % 5000) == 0) {
+                Log("module rediscover: clientBase=0 (client.dll not loaded yet)");
+            }
         }
     }
 
@@ -783,7 +858,7 @@ static void Tick() {
         InterlockedIncrement(&g_sharedVa->hdr.seq);
     }
 
-    if (logNow && (out > 0 || g_clientBase)) {   // не спамить, когда нет игры/сущностей
+    if (logNow && (out > 0 || g_clientBase)) {
         Log("tick: ctrl=%u pawn=%u alive=%u bone=%u out=%u maxPawn=%u reads=%u fails=%u",
             ctrlOk, pawnOk, aliveOk, boneOk, out, maxPawn,
             (ULONG)g_statReads, (ULONG)g_statReadFails);
@@ -929,6 +1004,8 @@ extern "C" NTSTATUS DriverEntry(PDRIVER_OBJECT drv, PUNICODE_STRING) {
     g_localPawn = 0; g_entitySystem = 0;
     g_stop = 0; g_workerThread = nullptr;
     g_logTick = 0; g_statReads = 0; g_statReadFails = 0;
+    g_lastPeb = 0;
+    g_fmbVerboseLogged = false;
     g_chunkCache = nullptr;
     g_bonesScratch = nullptr;
     g_pawnScratch = nullptr;
@@ -975,12 +1052,16 @@ extern "C" NTSTATUS DriverEntry(PDRIVER_OBJECT drv, PUNICODE_STRING) {
 
     st = ObReferenceObjectByHandle(h, THREAD_ALL_ACCESS, *PsThreadType, KernelMode,
                                    (PVOID*)&g_workerThread, nullptr);
-    ZwClose(h);
     if (!NT_SUCCESS(st)) {
+        // Поток уже запущен — сигналим стоп и дожидаемся через handle, пока он ещё открыт
         InterlockedExchange(&g_stop, 1);
         KeSetEvent(&g_workerEvent, 0, FALSE);
+        ZwWaitForSingleObject(h, FALSE, nullptr);
+        ZwClose(h);
+        DestroyShared();
         return st;
     }
+    ZwClose(h);
 
     Log("DriverEntry ok (MmCopyMemory PHYSICAL + Batch Read, res=%u): shared=%p view=%p",
         curRes, g_sharedVa, g_viewVa);
