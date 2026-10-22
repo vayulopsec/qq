@@ -116,20 +116,34 @@ static volatile LONG g_logTick        = 0;
 static volatile LONG g_statReads      = 0;
 static volatile LONG g_statReadFails  = 0;
 
-// ---- Локальный кэш трансляции адресов (TLB + PML4) на один тик ----
+// ---- Локальный кэш трансляции адресов (Direct-mapped TLB 256 + PML4) ----
+constexpr ULONG TLB_SIZE = 256;
+
+struct TlbEntry {
+    ULONG64 vaPage;
+    ULONG64 physPage;
+};
+
 struct TranslationCache {
-    ULONG64 lastVaPage;
-    ULONG64 lastPhysPage;
-    ULONG64 pml4[512];
-    BOOLEAN pml4Valid;
+    TlbEntry entries[TLB_SIZE];
+    ULONG64  pml4[512];
+    BOOLEAN  pml4Valid;
 };
 
 static TranslationCache g_tlb;
 
+// Вызывается каждый тик: сбрасывает только страницы, НЕ трогая PML4
 static __forceinline void ResetTlb() {
-    g_tlb.lastVaPage   = 0xFFFFFFFFFFFFFFFFULL;
-    g_tlb.lastPhysPage = 0;
-    g_tlb.pml4Valid    = FALSE;
+    for (ULONG i = 0; i < TLB_SIZE; ++i) {
+        g_tlb.entries[i].vaPage   = ~0ULL;
+        g_tlb.entries[i].physPage = 0;
+    }
+}
+
+// Вызывается при смене CR3, ошибке чтения или старте драйвера
+static __forceinline void ResetTlbFull() {
+    ResetTlb();
+    g_tlb.pml4Valid = FALSE;
 }
 
 // ---------------------------------------------------------------------------
@@ -239,8 +253,10 @@ static __forceinline ULONG64 ReadPhysicalQword(ULONG64 phys) {
 
 static __forceinline ULONG64 VirtualToPhysical(ULONG64 cr3, ULONG64 va) {
     ULONG64 vaPage = va & ~0xFFFULL;
-    if (vaPage == g_tlb.lastVaPage && g_tlb.lastPhysPage != 0) {
-        return g_tlb.lastPhysPage + (va & 0xFFFULL);
+    ULONG   slot   = (ULONG)((vaPage >> 12) & (TLB_SIZE - 1));
+
+    if (g_tlb.entries[slot].vaPage == vaPage && g_tlb.entries[slot].physPage != 0) {
+        return g_tlb.entries[slot].physPage + (va & 0xFFFULL);
     }
 
     if (!g_tlb.pml4Valid) {
@@ -259,8 +275,8 @@ static __forceinline ULONG64 VirtualToPhysical(ULONG64 cr3, ULONG64 va) {
     if (!(pdpte & 1)) return 0;
     if (pdpte & 0x80) {
         ULONG64 physBase = (pdpte & PHYS_MASK_1G) + (va & 0x3FFFF000ULL);
-        g_tlb.lastVaPage   = vaPage;
-        g_tlb.lastPhysPage = physBase;
+        g_tlb.entries[slot].vaPage   = vaPage;
+        g_tlb.entries[slot].physPage = physBase;
         return physBase + (va & 0xFFFULL);
     }
 
@@ -268,8 +284,8 @@ static __forceinline ULONG64 VirtualToPhysical(ULONG64 cr3, ULONG64 va) {
     if (!(pde & 1)) return 0;
     if (pde & 0x80) {
         ULONG64 physBase = (pde & PHYS_MASK_2M) + (va & 0x1FF000ULL);
-        g_tlb.lastVaPage   = vaPage;
-        g_tlb.lastPhysPage = physBase;
+        g_tlb.entries[slot].vaPage   = vaPage;
+        g_tlb.entries[slot].physPage = physBase;
         return physBase + (va & 0xFFFULL);
     }
 
@@ -277,8 +293,8 @@ static __forceinline ULONG64 VirtualToPhysical(ULONG64 cr3, ULONG64 va) {
     if (!(pte & 1)) return 0;
 
     ULONG64 physPage = pte & PHYS_MASK_4K;
-    g_tlb.lastVaPage   = vaPage;
-    g_tlb.lastPhysPage = physPage;
+    g_tlb.entries[slot].vaPage   = vaPage;
+    g_tlb.entries[slot].physPage = physPage;
     return physPage + (va & 0xFFFULL);
 }
 
@@ -291,8 +307,7 @@ static BOOLEAN ReadCs2Memory(ULONG64 va, PVOID buf, SIZE_T size) {
         ULONG64 curVa = va + done;
         ULONG64 startPhys = VirtualToPhysical(g_cs2Cr3, curVa);
         if (!startPhys) {
-            g_tlb.pml4Valid   = FALSE;          // форсим перечитывание PML4
-            g_tlb.lastVaPage  = ~0ULL;
+            ResetTlbFull();                     // форсим перечитывание PML4 и очистку TLB
             InterlockedIncrement(&g_statReadFails);
             return FALSE;
         }
@@ -311,8 +326,7 @@ static BOOLEAN ReadCs2Memory(ULONG64 va, PVOID buf, SIZE_T size) {
         }
 
         if (!ReadPhysicalCached(startPhys, out + done, chunk)) {
-            g_tlb.pml4Valid   = FALSE;
-            g_tlb.lastVaPage  = ~0ULL;
+            ResetTlbFull();
             InterlockedIncrement(&g_statReadFails);
             return FALSE;
         }
@@ -466,12 +480,23 @@ static void ClearShared() {
     InterlockedIncrement(&g_sharedVa->hdr.seq);
 }
 
-constexpr ULONG CACHED_CHUNKS = 4; // индексы 0..2047
-static UCHAR*         g_chunkCache   = nullptr; // CACHED_CHUNKS * 512 * 112 = 224 КБ
+constexpr ULONG CACHED_CHUNKS = 3; // индексы 0..1535 (для 5v5 хватает 2 -> 0..1023)
+static UCHAR*         g_chunkCache   = nullptr; // CACHED_CHUNKS * 512 * 112
 static UCHAR*         g_bonesScratch = nullptr; // MAX_BONES * 0x20 = 768 байт
 static UCHAR*         g_pawnScratch  = nullptr; // PAWN_BATCH_SIZE = 0xB8 байт
 static SHARED_ENTITY* g_localEnts    = nullptr; // Сборка текущего тика (вне Seqlock)
 static SHARED_ENTITY* g_prevEnts     = nullptr; // Кэш костей по слоту игрока (1..64) на случай промаха чтения
+
+struct SlotPtrCache {
+    ULONG64 ctrl;
+    ULONG   hPawn;
+    ULONG64 pawn;
+    ULONG64 scene;
+    ULONG64 bMat;
+    ULONG   lastUpdateTick;
+};
+
+static SlotPtrCache g_slotCache[MAX_ENTITIES] = {};
 
 static __forceinline ULONG64 FastEntityByIndex(const ULONG64* chunkPtrs,
                                                 const BOOLEAN* chunkValid,
@@ -510,7 +535,7 @@ static void Tick() {
         g_cs2Cr3 = GetProcessCr3(p);
         g_cs2Pid = pid;
         ObDereferenceObject(p);
-        ResetTlb();
+        ResetTlbFull();
 
         if (!s_processLogged) {
             Log("process found: pid=%p cr3=%llx", g_cs2Pid, g_cs2Cr3);
@@ -533,7 +558,7 @@ static void Tick() {
                 s_mzFailCount = 0;
                 Log("client.dll MZ check failed 3x, resetting clientBase");
                 g_clientBase = 0;          // НЕ сбрасываем g_cs2Cr3
-                ResetTlb();
+                ResetTlbFull();
                 needModuleCheck = true;
             }
         } else {
@@ -594,23 +619,56 @@ static void Tick() {
         }
     }
 
-    ULONG out = 0, ctrlOk = 0, pawnOk = 0, aliveOk = 0, boneOk = 0;
+    ULONG out = 0, ctrlOk = 0, pawnOk = 0, aliveOk = 0, boneOk = 0, maxPawn = 0;
 
     for (ULONG i = 1; i <= 64 && out < MAX_ENTITIES; ++i) {
         ULONG slotIdx = i - 1;
+        SlotPtrCache& sc = g_slotCache[slotIdx];
+
         ULONG64 ctrl = FastEntityByIndex(chunkPtrs, chunkValid, i);
-        if (!ctrl) continue;
+        if (!ctrl) {
+            sc.ctrl = 0;
+            if (g_prevEnts) g_prevEnts[slotIdx].valid = 0;
+            continue;
+        }
         ++ctrlOk;
 
-        ULONG hPawn = 0;
-        if (!RdD(ctrl + OFF_m_hPlayerPawn, &hPawn) || !hPawn || hPawn == 0xFFFFFFFF) continue;
+        // Обновляем связку ctrl -> hPawn раз в 20 тиков или при смене контроллера/отсутствии павна
+        bool refreshSlot = (ctrl != sc.ctrl) || !sc.pawn || ((tick - sc.lastUpdateTick) >= 20);
+        if (refreshSlot) {
+            ULONG hPawn = 0;
+            if (!RdD(ctrl + OFF_m_hPlayerPawn, &hPawn) || !hPawn || hPawn == 0xFFFFFFFF) {
+                sc.ctrl = ctrl;
+                sc.pawn = 0;
+                if (g_prevEnts) g_prevEnts[slotIdx].valid = 0;
+                continue;
+            }
+            sc.ctrl           = ctrl;
+            sc.hPawn          = hPawn;
+            sc.lastUpdateTick = tick - (i & 7); // размазываем обновления по тикам
+        }
 
-        ULONG64 pawn = FastEntityByIndex(chunkPtrs, chunkValid, hPawn & 0x7FFF);
-        if (!pawn || pawn == lp) continue;
+        ULONG pawnIdx = sc.hPawn & 0x7FFF;
+        if (pawnIdx > maxPawn) maxPawn = pawnIdx;
+
+        ULONG64 pawn = FastEntityByIndex(chunkPtrs, chunkValid, pawnIdx);
+        if (!pawn || pawn == lp) {
+            sc.pawn = 0;
+            if (g_prevEnts) g_prevEnts[slotIdx].valid = 0;
+            continue;
+        }
+        if (pawn != sc.pawn) {
+            sc.pawn  = pawn;
+            sc.scene = 0;
+            sc.bMat  = 0;
+        }
         ++pawnOk;
 
         if (!g_pawnScratch) continue;
-        if (!ReadCs2Memory(pawn + PAWN_BATCH_BASE, g_pawnScratch, PAWN_BATCH_SIZE)) continue;
+        if (!ReadCs2Memory(pawn + PAWN_BATCH_BASE, g_pawnScratch, PAWN_BATCH_SIZE)) {
+            sc.pawn = 0;
+            continue;
+        }
 
         ULONG64 scene = *(ULONG64*)(g_pawnScratch + (OFF_m_pGameSceneNode - PAWN_BATCH_BASE));
         int     hp    = *(int*)    (g_pawnScratch + (OFF_m_iHealth        - PAWN_BATCH_BASE));
@@ -618,21 +676,36 @@ static void Tick() {
         UCHAR   team  = *(UCHAR*)  (g_pawnScratch + (OFF_m_iTeamNum       - PAWN_BATCH_BASE));
 
         if (hp <= 0 || hp > 200 || ls != 0 || team == myTeam || !scene) {
+            sc.bMat = 0;
             if (g_prevEnts) g_prevEnts[slotIdx].valid = 0;
             continue;
         }
 
         ++aliveOk;
 
-        ULONG64 bMat = 0;
+        // Обновляем bMat только при смене scene, раз в 20 тиков или если bMat ещё не закэширован
+        if (scene != sc.scene || !sc.bMat || refreshSlot) {
+            ULONG64 newBMat = 0;
+            if (RdQ(scene + OFF_m_modelState + 0x80, &newBMat) && newBMat) {
+                sc.scene = scene;
+                sc.bMat  = newBMat;
+            } else {
+                sc.bMat = 0;
+            }
+        }
+
+        ULONG64 bMat = sc.bMat;
         bool bonesReadSuccess = false;
-        if (RdQ(scene + OFF_m_modelState + 0x80, &bMat) && bMat && g_bonesScratch) {
+        if (bMat && g_bonesScratch) {
             if (ReadCs2Memory(bMat, g_bonesScratch, MAX_BONES * 0x20)) {
                 // Проверяем, что кость головы (индекс 6 или 7) не нулевая
                 const ULONG* headBone = (const ULONG*)(g_bonesScratch + (SIZE_T)6 * 0x20);
                 if (headBone[0] != 0 || headBone[1] != 0 || headBone[2] != 0) {
                     bonesReadSuccess = true;
                 }
+            }
+            if (!bonesReadSuccess) {
+                sc.bMat = 0; // если кости нулевые или адрес протух — сбросим кэш bMat
             }
         }
 
@@ -697,8 +770,8 @@ static void Tick() {
     }
 
     if (logNow) {
-        Log("tick: ctrl=%u pawn=%u alive=%u bone=%u out=%u reads=%u fails=%u",
-            ctrlOk, pawnOk, aliveOk, boneOk, out,
+        Log("tick: ctrl=%u pawn=%u alive=%u bone=%u out=%u maxPawn=%u reads=%u fails=%u",
+            ctrlOk, pawnOk, aliveOk, boneOk, out, maxPawn,
             (ULONG)g_statReads, (ULONG)g_statReadFails);
     }
 }
@@ -847,7 +920,8 @@ extern "C" NTSTATUS DriverEntry(PDRIVER_OBJECT drv, PUNICODE_STRING) {
     g_pawnScratch = nullptr;
     g_localEnts = nullptr;
     g_prevEnts = nullptr;
-    ResetTlb();
+    RtlZeroMemory(g_slotCache, sizeof(g_slotCache));
+    ResetTlbFull();
 
     g_chunkCache = (UCHAR*)ExAllocatePool2(POOL_FLAG_NON_PAGED,
                                            CACHED_CHUNKS * 512 * ENTITY_STRIDE, POOL_TAG);
