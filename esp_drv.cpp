@@ -305,8 +305,7 @@ static BOOLEAN ReadCs2Memory(ULONG64 va, PVOID buf, SIZE_T size) {
         ULONG64 curVa = va + done;
         ULONG64 startPhys = VirtualToPhysical(g_cs2Cr3, curVa);
         if (!startPhys) {
-            ResetTlbPages();                    // очищаем все страницы
-            g_tlb.pml4Valid = FALSE;            // форсим перечитывание PML4
+            // Провал трансляции. НЕ сбрасываем TLB здесь — инвалидация только по смене CR3.
             InterlockedIncrement(&g_statReadFails);
             return FALSE;
         }
@@ -325,8 +324,7 @@ static BOOLEAN ReadCs2Memory(ULONG64 va, PVOID buf, SIZE_T size) {
         }
 
         if (!ReadPhysicalCached(startPhys, out + done, chunk)) {
-            ResetTlbPages();
-            g_tlb.pml4Valid = FALSE;
+            // Провал физического чтения. НЕ сбрасываем TLB — трансляция могла быть валидной.
             InterlockedIncrement(&g_statReadFails);
             return FALSE;
         }
@@ -395,6 +393,55 @@ static PEPROCESS FindCs2Process(HANDLE* outPid = nullptr) {
 static __forceinline ULONG64 GetProcessCr3(PEPROCESS p) {
     ULONG64 cr3 = *(ULONG64*)((PUCHAR)p + 0x28);
     return cr3 & PHYS_MASK_4K;   // срезаем PCID/флаги
+}
+
+// ---- Валидация CR3 ----
+static __forceinline BOOLEAN IsCr3Sane(ULONG64 cr3) {
+    if (!cr3) return FALSE;
+    if (cr3 & 0xFFF) return FALSE;                    // выравнивание на 4K
+    if (cr3 & ~PHYS_MASK_4K) return FALSE;            // только биты [51:12]
+    return TRUE;
+}
+
+// ---- Централизованный сброс состояния процесса ----
+static void ResetProcessState(const char* reason) {
+    Log("process state reset: %s (cr3=%llx pid=%p)", reason, g_cs2Cr3, g_cs2Pid);
+    g_cs2Cr3      = 0;
+    g_cs2Pid      = nullptr;
+    g_clientBase  = 0;
+    g_localPawn   = 0;
+    g_entitySystem = 0;
+    ResetTlb();
+    ClearShared();
+}
+
+static void ClearShared();  // forward declaration for ResetProcessState
+
+// ---- Сверка CR3 с живым процессом (каждый тик) ----
+static BOOLEAN VerifyCr3EachTick() {
+    if (!g_cs2Pid) return FALSE;
+
+    PEPROCESS p = nullptr;
+    if (!NT_SUCCESS(PsLookupProcessByProcessId(g_cs2Pid, &p)) || !p) {
+        ResetProcessState("process gone");
+        return FALSE;
+    }
+
+    ULONG64 cr3now = GetProcessCr3(p);
+    ObDereferenceObject(p);
+
+    if (!IsCr3Sane(cr3now)) {
+        ResetProcessState("cr3 insane");
+        return FALSE;
+    }
+    if (cr3now != g_cs2Cr3) {
+        // CR3 сменился (перезапуск / KPTI / своп) — кэш TLB и clientBase невалидны
+        g_cs2Cr3 = cr3now;
+        g_clientBase = 0;          // перепроверим MZ и, если надо, переищем модуль
+        ResetTlb();
+        Log("cr3 changed -> %llx", cr3now);
+    }
+    return TRUE;
 }
 
 typedef struct _LDR_ENTRY_OFF {
@@ -509,8 +556,14 @@ static void Tick() {
     static ULONG s_lastModuleAttempt = 0;
     static bool  s_processLogged = false;
     static ULONG s_emptyGraceTicks = 0;
+    static ULONG s_critFailTicks = 0;
     ULONG tick = ++s_tickCount;
     bool logNow = ((tick % 500) == 0);
+
+    // 0) Сверка CR3 с живым процессом (каждый тик)
+    if (g_cs2Pid) {
+        if (!VerifyCr3EachTick()) return;
+    }
 
     // 1) Поиск процесса
     if (!g_cs2Cr3) {
@@ -521,7 +574,14 @@ static void Tick() {
             if (logNow) Log("cs2.exe not found");
             return;
         }
-        g_cs2Cr3 = GetProcessCr3(p);
+        ULONG64 cr3 = GetProcessCr3(p);
+        if (!IsCr3Sane(cr3)) {
+            ObDereferenceObject(p);
+            ClearShared();
+            if (logNow) Log("cs2.exe found but CR3 insane (%llx)", cr3);
+            return;
+        }
+        g_cs2Cr3 = cr3;
         g_cs2Pid = pid;
         ObDereferenceObject(p);
         ResetTlb();
@@ -577,8 +637,19 @@ static void Tick() {
 
     // 3) Чтение данных игры (полностью ВНЕ Seqlock)
     ULONG64 lp = 0, es = 0;
-    RdQ(g_clientBase + OFF_dwLocalPlayerPawn, &lp);
-    RdQ(g_clientBase + OFF_dwEntityList, &es);
+    BOOLEAN gotLp = RdQ(g_clientBase + OFF_dwLocalPlayerPawn, &lp);
+    BOOLEAN gotEs = RdQ(g_clientBase + OFF_dwEntityList, &es);
+
+    // Детект мёртвого CR3 по критическим чтениям
+    if (!gotLp || !gotEs) {
+        if (++s_critFailTicks >= 4) {
+            s_critFailTicks = 0;
+            ResetProcessState("crit reads failed");
+        }
+        return;
+    }
+    s_critFailTicks = 0;
+
     g_localPawn = lp;
     g_entitySystem = es;
 
