@@ -1,976 +1,629 @@
-// esp_drv.cpp — CS2 ESP kernel driver (C++20, manual-map ready, no SEH, no STL/RTTI/exceptions)
-// build: MSVC + WDK, /std:c++20 /kernel /O2 /Ob3 /Oi /Ot /GS- /GR- /EHs-c- /EHc- /Zl
+// overlay_dll.cpp — C++20 multithreaded async proxy version.dll + DX11 VSync ImGui overlay
+// build: g++ -std=c++20 -O3 -march=native -flto -shared -municode -DUNICODE -D_UNICODE \
+//        -DWIN32_LEAN_AND_MEAN -DNOMINMAX -I. overlay_dll.cpp imgui.cpp \
+//        imgui_draw.cpp imgui_tables.cpp imgui_widgets.cpp \
+//        imgui_impl_win32.cpp imgui_impl_dx11.cpp -o version.dll \
+//        -ld3d11 -ldxgi -ld3dcompiler -ldwmapi -lgdi32 -lole32 -limm32 \
+//        -static-libgcc -static-libstdc++ -static -Wl,--kill-at
 
-#include <ntifs.h>
-#include <ntddk.h>
-#include <intrin.h>
-#include <stdarg.h>
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
 
-extern "C" NTSTATUS ZwQuerySystemInformation(
-    ULONG SystemInformationClass,
-    PVOID SystemInformation,
-    ULONG SystemInformationLength,
-    PULONG ReturnLength
-);
+#include <windows.h>
+#include <d3d11.h>
+#include <dxgi1_3.h>
+#include <dwmapi.h>
+#include <atomic>
+#include <array>
+#include <cmath>
+#include <cstdint>
+#include <cstdio>
+#include <cstdarg>
+#include <cstring>
+#include "imgui.h"
+#include "imgui_impl_win32.h"
+#include "imgui_impl_dx11.h"
 
-typedef enum _SECTION_INFORMATION_CLASS {
-    SectionBasicInformation = 0,
-    SectionImageInformation = 1
-} SECTION_INFORMATION_CLASS;
-
-typedef struct _SECTION_BASIC_INFORMATION {
-    PVOID         BaseAddress;
-    ULONG         Attributes;
-    LARGE_INTEGER Size;
-} SECTION_BASIC_INFORMATION, *PSECTION_BASIC_INFORMATION;
-
-extern "C" NTSTATUS ZwQuerySection(
-    HANDLE SectionHandle,
-    SECTION_INFORMATION_CLASS SectionInformationClass,
-    PVOID SectionInformation,
-    SIZE_T SectionInformationLength,
-    PSIZE_T ReturnLength
-);
-
-constexpr ULONG   POOL_TAG       = 'spSE';
-constexpr ULONG   MAX_ENTITIES   = 64;
-constexpr ULONG   MAX_BONES      = 24;
-constexpr ULONG   MAX_LOGS       = 256;
-constexpr ULONG   LOG_LINE_MAX   = 128;
-constexpr ULONG   ENTITY_STRIDE  = 112; // 0x70
-
-// ---- CS2 offsets (проверены по offsets_2.hpp и client_dll_2.hpp) ----
-constexpr ULONG64 OFF_dwEntityList      = 0x271A908ULL;
-constexpr ULONG64 OFF_dwLocalPlayerPawn = 0x2565718ULL;
-constexpr ULONG64 OFF_dwViewMatrix      = 0x256B020ULL;
-constexpr ULONG64 OFF_m_pGameSceneNode  = 0x330ULL;
-constexpr ULONG64 OFF_m_iHealth         = 0x34CULL;
-constexpr ULONG64 OFF_m_lifeState       = 0x354ULL;
-constexpr ULONG64 OFF_m_iTeamNum        = 0x3E7ULL;
-constexpr ULONG64 OFF_m_modelState      = 0x140ULL;
-constexpr ULONG64 OFF_m_hPlayerPawn     = 0x92CULL;
-
-// Диапазон пакетного чтения павна: от 0x330 (m_pGameSceneNode) до 0x3E7 + 1 (m_iTeamNum)
-constexpr ULONG64 PAWN_BATCH_BASE       = OFF_m_pGameSceneNode;
-constexpr SIZE_T  PAWN_BATCH_SIZE       = (OFF_m_iTeamNum + sizeof(UCHAR)) - PAWN_BATCH_BASE; // 0xB8 байт
-
-constexpr ULONG64 PHYS_MASK_4K          = 0x000FFFFFFFFFF000ULL;
-constexpr ULONG64 PHYS_MASK_2M          = 0x000FFFFFFFE00000ULL;
-constexpr ULONG64 PHYS_MASK_1G          = 0x000FFFFFC0000000ULL;
+// ===========================================================================
+// Контракт Shared Memory (1-в-1 с esp_drv.cpp)
+// ===========================================================================
+constexpr int MAX_ENTITIES = 256;
+constexpr int MAX_BONES    = 24;
+constexpr int MAX_LOGS     = 256;
+constexpr int LOG_LINE_MAX = 128;
 
 #pragma pack(push, 1)
-struct SHARED_BONE {
-    ULONG xBits, yBits, zBits; // Храним как сырые 32-битные поля (float на стороне usermode)
-};
-
-struct SHARED_ENTITY {
-    int         valid;
-    int         hp;
-    int         team;
-    int         pad0;
-    SHARED_BONE bones[MAX_BONES];
-};
-
-struct SHARED_HEADER {
-    volatile LONG seq;
-    ULONG         maxEntities;
-    ULONG         entityCount;
-    ULONG         version;
-};
-
-struct SHARED_LOG_ENTRY {
-    ULONG tick;
-    char  text[LOG_LINE_MAX];
-};
-
-struct SHARED_LOG {
-    volatile LONG    head;
-    volatile LONG    tail;
-    SHARED_LOG_ENTRY entries[MAX_LOGS];
-};
-
-struct SHARED_BLOCK {
-    SHARED_HEADER hdr;
-    SHARED_LOG    log;
-    SHARED_ENTITY ents[256];
-};
+struct SharedBone { float x, y, z; };
+struct SharedEntity { int valid; int hp; int team; int pad0; SharedBone bones[MAX_BONES]; };
+struct SharedHeader { volatile LONG seq; ULONG maxEntities; ULONG entityCount; ULONG version; };
+struct SharedLogEntry { ULONG tick; char text[LOG_LINE_MAX]; };
+struct SharedLog { volatile LONG head; volatile LONG tail; SharedLogEntry entries[MAX_LOGS]; };
+struct SharedBlock { SharedHeader hdr; SharedLog log; SharedEntity ents[MAX_ENTITIES]; };
 #pragma pack(pop)
 
-static HANDLE        g_hSharedSection = nullptr;
-static PVOID         g_sharedSecObj   = nullptr;
-static SHARED_BLOCK* g_sharedVa       = nullptr;
-static HANDLE        g_hViewSection   = nullptr;
-static PVOID         g_viewSecObj     = nullptr;
-static ULONG*        g_viewVa         = nullptr;
+static std::atomic<SharedBlock*> g_shm{nullptr};
+static std::atomic<float*>       g_view{nullptr};
+static HANDLE                    g_map     = nullptr;
+static HANDLE                    g_viewMap = nullptr;
+static std::atomic<bool>         g_run{true};
 
-static ULONG64       g_cs2Cr3         = 0;
-static ULONG64       g_clientBase     = 0;
-static HANDLE        g_cs2Pid         = nullptr;
-static ULONG64       g_localPawn      = 0;
-static ULONG64       g_entitySystem   = 0;
-static volatile LONG g_stop           = 0;
-static KEVENT        g_workerEvent;
-static PKTHREAD      g_workerThread   = nullptr;
+static std::atomic<int>          g_W{1920};
+static std::atomic<int>          g_H{1080};
 
-static volatile LONG g_logTick        = 0;
-static volatile LONG g_statReads      = 0;
-static volatile LONG g_statReadFails  = 0;
+// ===========================================================================
+// Асинхронный Тройной Буфер (Lock-Free Triple Buffering) между Worker и Render
+// ===========================================================================
+constexpr size_t BONE_CONNS_COUNT = 17;
+static constexpr std::array<std::pair<uint8_t, uint8_t>, BONE_CONNS_COUNT> CONN = {{
+    {1,3}, {3,4}, {4,23}, {23,6}, {6,7}, {6,9}, {9,10}, {10,11},
+    {6,13}, {13,14}, {14,15}, {1,17}, {17,18}, {18,19}, {1,20}, {20,21}, {21,22}
+}};
 
-// ---- Локальный кэш трансляции адресов (Direct-mapped TLB 256 + PML4) ----
-constexpr ULONG TLB_SIZE = 256;
-
-struct TlbEntry {
-    ULONG64 vaPage;
-    ULONG64 physPage;
+struct RenderReadyEntity {
+    int   hp;
+    bool  hasHead;
+    float headX, headY, headRadius;
+    uint32_t lineCount;
+    struct LineSeg { float x1, y1, x2, y2; } lines[BONE_CONNS_COUNT];
 };
 
-struct TranslationCache {
-    TlbEntry entries[TLB_SIZE];
-    ULONG64  pml4[512];
-    BOOLEAN  pml4Valid;
+struct RenderSnapshot {
+    uint32_t          count = 0;
+    LONG              seq   = -1;
+    ULONG             ver   = 0;
+    RenderReadyEntity ents[64];
 };
 
-static TranslationCache g_tlb;
+static RenderSnapshot        g_snapshots[3];
+// Младшие 2 бита — индекс центрального буфера (0, 1 или 2).
+// Бит 0x80 — флаг наличия нового кадра от Worker'а.
+// Изначально: 0 — у Worker'а (writeIdx), 1 — в центре (g_sharedSnapState), 2 — у Render'а (g_readIdx).
+static std::atomic<uint32_t> g_sharedSnapState{1};
+static uint32_t              g_readIdx = 2;
 
-// Вызывается каждый тик: сбрасывает только страницы, НЕ трогая PML4
-static __forceinline void ResetTlb() {
-    for (ULONG i = 0; i < TLB_SIZE; ++i) {
-        g_tlb.entries[i].vaPage   = ~0ULL;
-        g_tlb.entries[i].physPage = 0;
-    }
+// ===========================================================================
+// Потокобезопасное логирование (SRWLOCK — быстрее CRITICAL_SECTION в C++20)
+// ===========================================================================
+static FILE*   g_logFile       = nullptr;
+static SRWLOCK g_logLock       = SRWLOCK_INIT;
+static LONG    g_logFlushCount = 0;
+
+static void LogOpen() {
+    wchar_t tmp[MAX_PATH];
+    if (!GetTempPathW(MAX_PATH, tmp)) return;
+
+    wchar_t pathW[MAX_PATH];
+    _snwprintf_s(pathW, MAX_PATH, _TRUNCATE, L"%scs2esp_overlay.log", tmp);
+
+    char pathA[MAX_PATH * 2];
+    if (!WideCharToMultiByte(CP_UTF8, 0, pathW, -1, pathA, sizeof(pathA), nullptr, nullptr)) return;
+    fopen_s(&g_logFile, pathA, "a");
 }
 
-// Вызывается при смене CR3, ошибке чтения или старте драйвера
-static __forceinline void ResetTlbFull() {
-    ResetTlb();
-    g_tlb.pml4Valid = FALSE;
-}
-
-// ---------------------------------------------------------------------------
-// Мини-форматтер для kernel-mode: без UCRT, без FP
-// ---------------------------------------------------------------------------
-static char* KAppendChar(char* p, char* end, char c) {
-    if (p < end) *p++ = c;
-    return p;
-}
-
-static char* KAppendStr(char* p, char* end, const char* s) {
-    if (!s) s = "(null)";
-    while (*s && p < end) *p++ = *s++;
-    return p;
-}
-
-static char* KAppendUInt(char* p, char* end, unsigned long long v, unsigned base, bool upper) {
-    char tmp[32];
-    int n = 0;
-    const char* digits = upper ? "0123456789ABCDEF" : "0123456789abcdef";
-    if (v == 0) tmp[n++] = '0';
-    while (v && n < (int)sizeof(tmp)) { tmp[n++] = digits[v % base]; v /= base; }
-    while (n > 0 && p < end) *p++ = tmp[--n];
-    return p;
-}
-
-static char* KAppendInt(char* p, char* end, long long v) {
-    if (v < 0) {
-        p = KAppendChar(p, end, '-');
-        return KAppendUInt(p, end, (unsigned long long)(-v), 10, false);
-    }
-    return KAppendUInt(p, end, (unsigned long long)v, 10, false);
-}
-
-static void KVPrintf(char* out, SIZE_T outCap, const char* fmt, va_list ap) {
-    if (!out || outCap == 0) return;
-    char* p = out;
-    char* end = out + outCap - 1;
-    while (*fmt && p < end) {
-        if (*fmt != '%') { *p++ = *fmt++; continue; }
-        ++fmt;
-        int lcount = 0;
-        while (*fmt == 'l') { ++lcount; ++fmt; }
-        bool isLongLong = (lcount >= 2);
-        if (*fmt == 'X') { ++fmt;
-            unsigned long long v = isLongLong ? va_arg(ap, unsigned long long) : (unsigned long long)va_arg(ap, unsigned int);
-            p = KAppendUInt(p, end, v, 16, true); continue; }
-        if (*fmt == 'x') { ++fmt;
-            unsigned long long v = isLongLong ? va_arg(ap, unsigned long long) : (unsigned long long)va_arg(ap, unsigned int);
-            p = KAppendUInt(p, end, v, 16, false); continue; }
-        if (*fmt == 'u') { ++fmt;
-            unsigned long long v = isLongLong ? va_arg(ap, unsigned long long) : (unsigned long long)va_arg(ap, unsigned int);
-            p = KAppendUInt(p, end, v, 10, false); continue; }
-        if (*fmt == 'd' || *fmt == 'i') { ++fmt;
-            long long v = isLongLong ? va_arg(ap, long long) : (long long)va_arg(ap, int);
-            p = KAppendInt(p, end, v); continue; }
-        if (*fmt == 'p') { ++fmt;
-            p = KAppendStr(p, end, "0x");
-            p = KAppendUInt(p, end, (unsigned long long)(ULONG_PTR)va_arg(ap, void*), 16, false);
-            continue; }
-        if (*fmt == 's') { ++fmt; p = KAppendStr(p, end, va_arg(ap, const char*)); continue; }
-        if (*fmt == 'c') { ++fmt; p = KAppendChar(p, end, (char)va_arg(ap, int)); continue; }
-        p = KAppendChar(p, end, '%');
-        if (*fmt) p = KAppendChar(p, end, *fmt++);
-    }
-    *p = 0;
-}
-
-static void LogRaw(const char* text) {
-    DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL, "[esp_drv] %s\n", text);
-    if (!g_sharedVa) return;
-    ULONG tail = (ULONG)InterlockedIncrement(&g_sharedVa->log.tail) - 1;
-    ULONG slot = tail % MAX_LOGS;
-    g_sharedVa->log.entries[slot].tick = (ULONG)InterlockedIncrement(&g_logTick);
-    char* dst = g_sharedVa->log.entries[slot].text;
-    const char* src = text;
-    SIZE_T n = 0;
-    while (*src && n < LOG_LINE_MAX - 1) { dst[n++] = *src++; }
-    dst[n] = 0;
-}
-
-static void Log(const char* fmt, ...) {
-    char buf[LOG_LINE_MAX];
+static void LogSelf(const char* fmt, ...) {
+    char buf[512];
     va_list ap;
     va_start(ap, fmt);
-    KVPrintf(buf, sizeof(buf), fmt, ap);
+    _vsnprintf_s(buf, sizeof(buf), _TRUNCATE, fmt, ap);
     va_end(ap);
-    LogRaw(buf);
-}
 
-static __forceinline BOOLEAN ReadPhysicalCached(ULONG64 phys, PVOID buf, SIZE_T size) {
-    if (!phys || !buf || !size) return FALSE;
-    MM_COPY_ADDRESS src;
-    PHYSICAL_ADDRESS pa;
-    SIZE_T copied = 0;
-    pa.QuadPart = (LONGLONG)phys;
-    src.PhysicalAddress = pa;
-    NTSTATUS st = MmCopyMemory(buf, src, size, MM_COPY_MEMORY_PHYSICAL, &copied);
-    return NT_SUCCESS(st) && copied == size;
-}
+    SYSTEMTIME st;
+    GetLocalTime(&st);
+    char line[640];
+    _snprintf_s(line, sizeof(line), _TRUNCATE,
+                "[%02u:%02u:%02u.%03u][self] %s\n",
+                st.wHour, st.wMinute, st.wSecond, st.wMilliseconds, buf);
 
-static __forceinline ULONG64 ReadPhysicalQword(ULONG64 phys) {
-    ULONG64 v = 0;
-    ReadPhysicalCached(phys, &v, sizeof(v));
-    return v;
-}
+    OutputDebugStringA(line);
 
-static __forceinline ULONG64 VirtualToPhysical(ULONG64 cr3, ULONG64 va) {
-    ULONG64 vaPage = va & ~0xFFFULL;
-    ULONG   slot   = (ULONG)((vaPage >> 12) & (TLB_SIZE - 1));
-
-    if (g_tlb.entries[slot].vaPage == vaPage && g_tlb.entries[slot].physPage != 0) {
-        return g_tlb.entries[slot].physPage + (va & 0xFFFULL);
-    }
-
-    if (!g_tlb.pml4Valid) {
-        if (ReadPhysicalCached(cr3 & PHYS_MASK_4K, g_tlb.pml4, sizeof(g_tlb.pml4))) {
-            g_tlb.pml4Valid = TRUE;
+    AcquireSRWLockExclusive(&g_logLock);
+    if (g_logFile) {
+        fputs(line, g_logFile);
+        if (++g_logFlushCount >= 64) {
+            g_logFlushCount = 0;
+            fflush(g_logFile);
         }
     }
-
-    ULONG pml4Idx = (ULONG)((va >> 39) & 0x1FF);
-    ULONG64 pml4e = g_tlb.pml4Valid
-        ? g_tlb.pml4[pml4Idx]
-        : ReadPhysicalQword((cr3 & PHYS_MASK_4K) + 8ULL * pml4Idx);
-    if (!(pml4e & 1)) return 0;
-
-    ULONG64 pdpte = ReadPhysicalQword((pml4e & PHYS_MASK_4K) + 8ULL * ((va >> 30) & 0x1FF));
-    if (!(pdpte & 1)) return 0;
-    if (pdpte & 0x80) {
-        ULONG64 physBase = (pdpte & PHYS_MASK_1G) + (va & 0x3FFFF000ULL);
-        g_tlb.entries[slot].vaPage   = vaPage;
-        g_tlb.entries[slot].physPage = physBase;
-        return physBase + (va & 0xFFFULL);
-    }
-
-    ULONG64 pde = ReadPhysicalQword((pdpte & PHYS_MASK_4K) + 8ULL * ((va >> 21) & 0x1FF));
-    if (!(pde & 1)) return 0;
-    if (pde & 0x80) {
-        ULONG64 physBase = (pde & PHYS_MASK_2M) + (va & 0x1FF000ULL);
-        g_tlb.entries[slot].vaPage   = vaPage;
-        g_tlb.entries[slot].physPage = physBase;
-        return physBase + (va & 0xFFFULL);
-    }
-
-    ULONG64 pte = ReadPhysicalQword((pde & PHYS_MASK_4K) + 8ULL * ((va >> 12) & 0x1FF));
-    if (!(pte & 1)) return 0;
-
-    ULONG64 physPage = pte & PHYS_MASK_4K;
-    g_tlb.entries[slot].vaPage   = vaPage;
-    g_tlb.entries[slot].physPage = physPage;
-    return physPage + (va & 0xFFFULL);
+    ReleaseSRWLockExclusive(&g_logLock);
 }
 
-static BOOLEAN ReadCs2Memory(ULONG64 va, PVOID buf, SIZE_T size) {
-    if (!g_cs2Cr3 || !va || !buf || !size) return FALSE;
-    PUCHAR out = (PUCHAR)buf;
-    SIZE_T done = 0;
+static void LogKernelLine(const SharedLogEntry& le) {
+    if (!le.text[0]) return;
+    char line[640];
+    _snprintf_s(line, sizeof(line), _TRUNCATE, "[kernel #%u] %s\n", le.tick, le.text);
+    OutputDebugStringA(line);
 
-    while (done < size) {
-        ULONG64 curVa = va + done;
-        ULONG64 startPhys = VirtualToPhysical(g_cs2Cr3, curVa);
-        if (!startPhys) {
-            ResetTlbFull();                     // форсим перечитывание PML4 и очистку TLB
-            InterlockedIncrement(&g_statReadFails);
-            return FALSE;
+    AcquireSRWLockExclusive(&g_logLock);
+    if (g_logFile) {
+        fputs(line, g_logFile);
+        if (++g_logFlushCount >= 64) {
+            g_logFlushCount = 0;
+            fflush(g_logFile);
         }
-
-        SIZE_T chunk = 0x1000 - (curVa & 0xFFF);
-        if (chunk > size - done) chunk = size - done;
-
-        while (done + chunk < size) {
-            ULONG64 nextVa = curVa + chunk;
-            ULONG64 nextPhys = VirtualToPhysical(g_cs2Cr3, nextVa);
-            if (nextPhys != startPhys + chunk) break;
-
-            SIZE_T add = 0x1000;
-            if (chunk + add > size - done) add = (size - done) - chunk;
-            chunk += add;
-        }
-
-        if (!ReadPhysicalCached(startPhys, out + done, chunk)) {
-            ResetTlbFull();
-            InterlockedIncrement(&g_statReadFails);
-            return FALSE;
-        }
-        InterlockedIncrement(&g_statReads);
-        done += chunk;
     }
-    return TRUE;
+    ReleaseSRWLockExclusive(&g_logLock);
 }
 
-static __forceinline BOOLEAN RdQ(ULONG64 va, PULONG64 out) { return ReadCs2Memory(va, out, sizeof(ULONG64)); }
-static __forceinline BOOLEAN RdD(ULONG64 va, PULONG   out) { return ReadCs2Memory(va, out, sizeof(ULONG)); }
-
-// ---- Поиск процесса и базы client.dll ----
-typedef struct _SYSTEM_PROCESS_INFO {
-    ULONG NextEntryOffset; ULONG NumberOfThreads; LARGE_INTEGER WorkingSetPrivateSize; ULONG HardFaultCount;
-    ULONG NumberOfThreadsHighWatermark; ULONGLONG CycleTime; LARGE_INTEGER CreateTime; LARGE_INTEGER UserTime;
-    LARGE_INTEGER KernelTime; UNICODE_STRING ImageName; KPRIORITY BasePriority; HANDLE UniqueProcessId;
-    HANDLE InheritedFromUniqueProcessId; ULONG HandleCount; ULONG SessionId; ULONG_PTR UniqueProcessKey;
-    SIZE_T PeakVirtualSize; SIZE_T VirtualSize; ULONG PageFaultCount; SIZE_T PeakWorkingSetSize;
-    SIZE_T WorkingSetSize; SIZE_T QuotaPeakPagedPoolUsage; SIZE_T QuotaPagedPoolUsage;
-    SIZE_T QuotaPeakNonPagedPoolUsage; SIZE_T QuotaNonPagedPoolUsage; SIZE_T PagefileUsage;
-    SIZE_T PeakPagefileUsage; SIZE_T PrivatePageCount; LARGE_INTEGER ReadOperationCount;
-    LARGE_INTEGER WriteOperationCount; LARGE_INTEGER OtherOperationCount; LARGE_INTEGER ReadTransferCount;
-    LARGE_INTEGER WriteTransferCount; LARGE_INTEGER OtherTransferCount;
-} SYSTEM_PROCESS_INFO, *PSYSTEM_PROCESS_INFO;
-
-static PEPROCESS FindCs2Process(HANDLE* outPid = nullptr) {
-    ULONG size = 0x20000;
-    PVOID buf = nullptr;
-    NTSTATUS st = STATUS_INFO_LENGTH_MISMATCH;
-    for (int i = 0; i < 4; ++i) {
-        buf = ExAllocatePool2(POOL_FLAG_NON_PAGED, size, POOL_TAG);
-        if (!buf) return nullptr;
-        st = ZwQuerySystemInformation(5, buf, size, &size);
-        if (NT_SUCCESS(st)) break;
-        ExFreePoolWithTag(buf, POOL_TAG);
-        buf = nullptr;
-        if (st != STATUS_INFO_LENGTH_MISMATCH) return nullptr;
-        size *= 2;
+static LONG g_lastKernelTail = 0;
+static void DrainKernelLogs() {
+    SharedBlock* shm = g_shm.load(std::memory_order_acquire);
+    if (!shm) return;
+    LONG tail = shm->log.tail;
+    if (tail == g_lastKernelTail) return;
+    if (tail < g_lastKernelTail) g_lastKernelTail = 0;
+    LONG start = g_lastKernelTail;
+    LONG count = tail - start;
+    if (count > MAX_LOGS) { start = tail - MAX_LOGS; count = MAX_LOGS; }
+    for (LONG i = 0; i < count; ++i) {
+        LONG idx = (start + i) % MAX_LOGS;
+        if (idx < 0) idx += MAX_LOGS;
+        LogKernelLine(shm->log.entries[idx]);
     }
-    if (!buf) return nullptr;
+    g_lastKernelTail = tail;
+}
 
-    UNICODE_STRING target;
-    RtlInitUnicodeString(&target, L"cs2.exe");
-    PSYSTEM_PROCESS_INFO spi = (PSYSTEM_PROCESS_INFO)buf;
-    PEPROCESS found = nullptr;
-    HANDLE foundPid = nullptr;
+// ===========================================================================
+// Proxy version.dll экспорты
+// ===========================================================================
+typedef WINBOOL (WINAPI* fnGVIA)(LPCSTR,DWORD,DWORD,LPVOID);
+typedef WINBOOL (WINAPI* fnGVIW)(LPCWSTR,DWORD,DWORD,LPVOID);
+typedef DWORD   (WINAPI* fnGVISA)(LPCSTR,LPDWORD);
+typedef DWORD   (WINAPI* fnGVISW)(LPCWSTR,LPDWORD);
+typedef WINBOOL (WINAPI* fnVQVA)(LPCVOID,LPCSTR,LPVOID*,PUINT);
+typedef WINBOOL (WINAPI* fnVQVW)(LPCVOID,LPCWSTR,LPVOID*,PUINT);
 
-    for (;;) {
-        if (spi->ImageName.Buffer && spi->ImageName.Length) {
-            if (RtlEqualUnicodeString(&spi->ImageName, &target, TRUE)) {
-                if (NT_SUCCESS(PsLookupProcessByProcessId(spi->UniqueProcessId, &found))) {
-                    foundPid = spi->UniqueProcessId;
-                    break;
+static fnGVIA  pGVIA  = nullptr;
+static fnGVIW  pGVIW  = nullptr;
+static fnGVISA pGVISA = nullptr;
+static fnGVISW pGVISW = nullptr;
+static fnVQVA  pVQVA  = nullptr;
+static fnVQVW  pVQVW  = nullptr;
+
+extern "C" __declspec(dllexport) WINBOOL WINAPI GetFileVersionInfoA(LPCSTR a,DWORD b,DWORD c,LPVOID d){ return pGVIA ? pGVIA(a,b,c,d) : FALSE; }
+extern "C" __declspec(dllexport) WINBOOL WINAPI GetFileVersionInfoW(LPCWSTR a,DWORD b,DWORD c,LPVOID d){ return pGVIW ? pGVIW(a,b,c,d) : FALSE; }
+extern "C" __declspec(dllexport) DWORD   WINAPI GetFileVersionInfoSizeA(LPCSTR a,LPDWORD b){ return pGVISA ? pGVISA(a,b) : 0; }
+extern "C" __declspec(dllexport) DWORD   WINAPI GetFileVersionInfoSizeW(LPCWSTR a,LPDWORD b){ return pGVISW ? pGVISW(a,b) : 0; }
+extern "C" __declspec(dllexport) WINBOOL WINAPI VerQueryValueA(LPCVOID a,LPCSTR b,LPVOID* c,PUINT d){ return pVQVA ? pVQVA(a,b,c,d) : FALSE; }
+extern "C" __declspec(dllexport) WINBOOL WINAPI VerQueryValueW(LPCVOID a,LPCWSTR b,LPVOID* c,PUINT d){ return pVQVW ? pVQVW(a,b,c,d) : FALSE; }
+
+static void LoadReal() {
+    wchar_t p[MAX_PATH];
+    GetSystemDirectoryW(p, MAX_PATH);
+    wcscat_s(p, L"\\version.dll");
+    HMODULE h = LoadLibraryW(p);
+    if (!h) return;
+    pGVIA  = (fnGVIA) GetProcAddress(h, "GetFileVersionInfoA");
+    pGVIW  = (fnGVIW) GetProcAddress(h, "GetFileVersionInfoW");
+    pGVISA = (fnGVISA)GetProcAddress(h, "GetFileVersionInfoSizeA");
+    pGVISW = (fnGVISW)GetProcAddress(h, "GetFileVersionInfoSizeW");
+    pVQVA  = (fnVQVA) GetProcAddress(h, "VerQueryValueA");
+    pVQVW  = (fnVQVW) GetProcAddress(h, "VerQueryValueW");
+}
+
+// ===========================================================================
+// Быстрая математика и асинхронный поток предобработки (Async Worker Thread)
+// ===========================================================================
+static __forceinline bool FastW2S(const float* __restrict m, float x, float y, float z,
+                                  float cx, float cy, float& sx, float& sy) noexcept {
+    const float sw = m[12] * x + m[13] * y + m[14] * z + m[15];
+    if (sw <= 0.001f) return false;
+    const float invW = 1.0f / sw;
+    sx = cx + (cx * (m[0] * x + m[1] * y + m[2] * z + m[3]) * invW);
+    sy = cy - (cy * (m[4] * x + m[5] * y + m[6] * z + m[7]) * invW);
+    return true;
+}
+
+static DWORD WINAPI AsyncDataWorkerThread(LPVOID) {
+    SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_ABOVE_NORMAL);
+
+    SharedEntity localEnts[64];
+    float        vm[16];
+    uint32_t     writeIdx = 0;
+    LONG         lastProcessedSeq = -1;
+    int          spin = 0;
+
+    while (g_run.load(std::memory_order_relaxed)) {
+        SharedBlock* shm  = g_shm.load(std::memory_order_acquire);
+        float*       view = g_view.load(std::memory_order_acquire);
+
+        if (!shm || !view) {
+            Sleep(5);
+            continue;
+        }
+
+        LONG s1 = shm->hdr.seq;
+        if (s1 & 1) {
+            YieldProcessor();
+            continue;
+        }
+
+        if (s1 == lastProcessedSeq) {
+            if (++spin < 100) {
+                YieldProcessor();
+            } else {
+                spin = 0;
+                SwitchToThread();
+            }
+            continue;
+        }
+        spin = 0;
+
+        std::atomic_thread_fence(std::memory_order_acquire);
+
+        ULONG n = shm->hdr.entityCount;
+        if (n > 64) n = 64;
+        if (n > 0) {
+            std::memcpy(localEnts, (const void*)shm->ents, n * sizeof(SharedEntity));
+        }
+        ULONG ver = shm->hdr.version;
+        std::memcpy(vm, (const void*)view, sizeof(vm));
+
+        std::atomic_thread_fence(std::memory_order_acquire);
+        LONG s2 = shm->hdr.seq;
+        if (s1 != s2) {
+            YieldProcessor();
+            continue;
+        }
+
+        lastProcessedSeq = s2;
+
+        const float cx = g_W.load(std::memory_order_relaxed) * 0.5f;
+        const float cy = g_H.load(std::memory_order_relaxed) * 0.5f;
+
+        RenderSnapshot& snap = g_snapshots[writeIdx];
+        snap.seq = s2;
+        snap.ver = ver;
+        uint32_t outCount = 0;
+
+        for (ULONG e = 0; e < n; ++e) {
+            const SharedEntity& en = localEnts[e];
+            if (!en.valid || en.hp <= 0) continue;
+
+            float sx[MAX_BONES];
+            float sy[MAX_BONES];
+            bool  ok[MAX_BONES]{};
+
+            for (int b = 0; b < MAX_BONES; ++b) {
+                const auto& bone = en.bones[b];
+                if (bone.x == 0.f && bone.y == 0.f && bone.z == 0.f) continue;
+                ok[b] = FastW2S(vm, bone.x, bone.y, bone.z, cx, cy, sx[b], sy[b]);
+            }
+
+            RenderReadyEntity& re = snap.ents[outCount];
+            re.hp = en.hp;
+            re.lineCount = 0;
+
+            for (const auto& [b1, b2] : CONN) {
+                if (ok[b1] && ok[b2]) {
+                    auto& seg = re.lines[re.lineCount++];
+                    seg.x1 = sx[b1]; seg.y1 = sy[b1];
+                    seg.x2 = sx[b2]; seg.y2 = sy[b2];
                 }
             }
-        }
-        if (!spi->NextEntryOffset) break;
-        spi = (PSYSTEM_PROCESS_INFO)((PUCHAR)spi + spi->NextEntryOffset);
-    }
-    ExFreePoolWithTag(buf, POOL_TAG);
-    if (outPid) *outPid = foundPid;
-    return found;
-}
 
-static __forceinline ULONG64 GetProcessCr3(PEPROCESS p) {
-    ULONG64 cr3 = *(ULONG64*)((PUCHAR)p + 0x28);
-    return cr3 & PHYS_MASK_4K;   // срезаем PCID/флаги
-}
-
-typedef struct _LDR_ENTRY_OFF {
-    LIST_ENTRY InLoadOrderLinks; PVOID ExceptionTable; ULONG ExceptionTableSize; PVOID GpValue;
-    PVOID NonPagedDebugInfo; PVOID DllBase; PVOID EntryPoint; ULONG SizeOfImage;
-    UNICODE_STRING FullDllName; UNICODE_STRING BaseDllName;
-} LDR_ENTRY_OFF;
-
-static ULONG64 FindModuleBase(PEPROCESS proc, PCWSTR moduleName, bool verbose) {
-    UNICODE_STRING fnName;
-    RtlInitUnicodeString(&fnName, L"PsGetProcessPeb");
-    typedef PVOID(*fnPeb)(PEPROCESS);
-    fnPeb fn = (fnPeb)MmGetSystemRoutineAddress(&fnName);
-    if (!fn) { if (verbose) Log("FMB: PsGetProcessPeb not resolved"); return 0; }
-
-    ULONG64 peb = (ULONG64)fn(proc);
-    if (verbose) Log("FMB: peb=%llx", peb);
-    if (!peb) return 0;
-
-    UNICODE_STRING want;
-    RtlInitUnicodeString(&want, moduleName);
-
-    ULONG64 ldr = 0;
-    if (!RdQ(peb + 0x18, &ldr) || !ldr) {
-        if (verbose) Log("FMB: ldr read fail/null (client.dll not loaded yet?)");
-        return 0;
-    }
-    if (verbose) Log("FMB: ldr=%llx", ldr);
-
-    ULONG64 head = ldr + 0x10;
-    ULONG64 cur = 0;
-    if (!RdQ(head, &cur)) {
-        if (verbose) Log("FMB: head read fail");
-        return 0;
-    }
-    if (verbose) Log("FMB: head=%llx firstCur=%llx", head, cur);
-
-    int guard = 0;
-    for (; guard < 2048 && cur && cur != head; ++guard) {
-        LDR_ENTRY_OFF e = {};
-        if (!ReadCs2Memory(cur, &e, sizeof(e))) {
-            if (verbose) Log("FMB: entry read fail cur=%llx guard=%d", cur, guard);
-            return 0;
-        }
-        if (e.BaseDllName.Buffer && e.BaseDllName.Length) {
-            WCHAR n[128] = {};
-            USHORT len = e.BaseDllName.Length;
-            if (len > sizeof(n) - sizeof(WCHAR)) len = sizeof(n) - sizeof(WCHAR);
-            if (ReadCs2Memory((ULONG64)e.BaseDllName.Buffer, n, len)) {
-                n[len / sizeof(WCHAR)] = 0;
-                UNICODE_STRING un;
-                RtlInitUnicodeString(&un, n);
-                if (RtlEqualUnicodeString(&un, &want, TRUE)) {
-                    // ВАЛИДАЦИЯ: по DllBase реально должен читаться "MZ"
-                    ULONG64 base = (ULONG64)e.DllBase;
-                    USHORT mz = 0;
-                    if (base && ReadCs2Memory(base, &mz, sizeof(mz)) && mz == 0x5A4D) {
-                        if (verbose) Log("FMB: found at %llx (guard=%d) MZ ok", base, guard);
-                        return base;
-                    }
-                    if (verbose) Log("FMB: candidate %llx guard=%d MZ fail, skip", base, guard);
-                    // не возвращаем — идём дальше по списку
+            re.hasHead = ok[7];
+            if (ok[7]) {
+                re.headX = sx[7];
+                re.headY = sy[7];
+                float r = 4.0f;
+                if (ok[6]) {
+                    const float dx = sx[7] - sx[6];
+                    const float dy = sy[7] - sy[6];
+                    const float dd = std::sqrt(dx * dx + dy * dy);
+                    r = dd < 2.f ? 2.f : (dd > 15.f ? 15.f : dd);
                 }
+                re.headRadius = r;
             }
+            ++outCount;
         }
-        cur = (ULONG64)e.InLoadOrderLinks.Flink;
-        // ВАЛИДАЦИЯ Flink: должен быть в user-space и выровнен на 8
-        if (!cur || cur >= 0x7FFFFFFFFFFFULL || (cur & 7)) {
-            if (verbose) Log("FMB: bad Flink=%llx guard=%d, break", cur, guard);
-            break;
-        }
+
+        snap.count = outCount;
+
+        uint32_t prev = g_sharedSnapState.exchange(writeIdx | 0x80u, std::memory_order_acq_rel);
+        writeIdx = prev & 0x03u;
     }
-    if (verbose) Log("FMB: not found guard=%d cur=%llx", guard, cur);
     return 0;
 }
 
-static void ClearShared() {
-    if (!g_sharedVa) return;
-    InterlockedIncrement(&g_sharedVa->hdr.seq);
-    KeMemoryBarrier();
-    g_sharedVa->hdr.entityCount = 0;
-    KeMemoryBarrier();
-    InterlockedIncrement(&g_sharedVa->hdr.seq);
+// ===========================================================================
+// DirectX 11 + VSync Waitable SwapChain
+// ===========================================================================
+static HWND                    g_hWnd            = nullptr;
+static ID3D11Device*           g_dev             = nullptr;
+static ID3D11DeviceContext*    g_ctx             = nullptr;
+static IDXGISwapChain*         g_sc              = nullptr;
+static ID3D11RenderTargetView* g_rtv             = nullptr;
+static HANDLE                  g_frameWaitable   = nullptr;
+
+extern IMGUI_IMPL_API LRESULT ImGui_ImplWin32_WndProcHandler(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam);
+
+static LRESULT WINAPI WndProc(HWND h, UINT m, WPARAM w, LPARAM l) {
+    if (ImGui_ImplWin32_WndProcHandler(h, m, w, l)) return true;
+    if (m == WM_DESTROY) {
+        PostQuitMessage(0);
+        g_run.store(false, std::memory_order_release);
+        return 0;
+    }
+    return DefWindowProcW(h, m, w, l);
 }
 
-constexpr ULONG CACHED_CHUNKS = 3; // индексы 0..1535 (для 5v5 хватает 2 -> 0..1023)
-static UCHAR*         g_chunkCache   = nullptr; // CACHED_CHUNKS * 512 * 112
-static UCHAR*         g_bonesScratch = nullptr; // MAX_BONES * 0x20 = 768 байт
-static UCHAR*         g_pawnScratch  = nullptr; // PAWN_BATCH_SIZE = 0xB8 байт
-static SHARED_ENTITY* g_localEnts    = nullptr; // Сборка текущего тика (вне Seqlock)
-static SHARED_ENTITY* g_prevEnts     = nullptr; // Кэш костей по слоту игрока (1..64) на случай промаха чтения
+static bool CreateDev(HWND h) {
+    DXGI_SWAP_CHAIN_DESC sd = {};
+    sd.BufferDesc.Width  = g_W.load();
+    sd.BufferDesc.Height = g_H.load();
+    sd.BufferDesc.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+    sd.BufferDesc.RefreshRate.Numerator   = 0;
+    sd.BufferDesc.RefreshRate.Denominator = 1;
+    sd.SampleDesc.Count  = 1;
+    sd.BufferUsage       = DXGI_USAGE_RENDER_TARGET_OUTPUT;
+    sd.BufferCount       = 2;
+    sd.OutputWindow      = h;
+    sd.Windowed          = TRUE;
+    sd.SwapEffect        = DXGI_SWAP_EFFECT_DISCARD;
+    sd.Flags             = DXGI_SWAP_CHAIN_FLAG_ALLOW_MODE_SWITCH;
 
-struct SlotPtrCache {
-    ULONG64 ctrl;
-    ULONG   hPawn;
-    ULONG64 pawn;
-    ULONG64 scene;
-    ULONG64 bMat;
-    ULONG   lastUpdateTick;
-};
+    D3D_FEATURE_LEVEL fl;
+    const D3D_FEATURE_LEVEL fls[] = { D3D_FEATURE_LEVEL_11_0, D3D_FEATURE_LEVEL_10_0 };
+    HRESULT hr = D3D11CreateDeviceAndSwapChain(
+        nullptr, D3D_DRIVER_TYPE_HARDWARE, nullptr, D3D11_CREATE_DEVICE_SINGLETHREADED,
+        fls, 2, D3D11_SDK_VERSION, &sd, &g_sc, &g_dev, &fl, &g_ctx);
+    if (FAILED(hr)) {
+        LogSelf("D3D11CreateDeviceAndSwapChain failed hr=0x%08lX", (unsigned long)hr);
+        return false;
+    }
 
-static SlotPtrCache g_slotCache[MAX_ENTITIES] = {};
+    IDXGIDevice1* dxgiDev = nullptr;
+    if (SUCCEEDED(g_dev->QueryInterface(__uuidof(IDXGIDevice1), (void**)&dxgiDev)) && dxgiDev) {
+        dxgiDev->SetMaximumFrameLatency(1);
+        dxgiDev->Release();
+    }
 
-static __forceinline ULONG64 FastEntityByIndex(const ULONG64* chunkPtrs,
-                                                const BOOLEAN* chunkValid,
-                                                ULONG idx) {
-    if (idx > 0x7FFE) return 0;
-    ULONG c = idx >> 9;
-    ULONG subIdx = idx & 0x1FF;
-    if (c >= CACHED_CHUNKS) return 0;
-    if (!chunkValid[c] || !g_chunkCache) return 0;
-    const UCHAR* entryPtr = g_chunkCache + (SIZE_T)c * 512 * ENTITY_STRIDE
-                          + (SIZE_T)subIdx * ENTITY_STRIDE;
-    ULONG ident = *(const ULONG*)(entryPtr + 0x10);
-    if ((ident & 0x7FFF) != idx) return 0;
-    return *(const ULONG64*)entryPtr;
+    ID3D11Texture2D* bb = nullptr;
+    g_sc->GetBuffer(0, IID_PPV_ARGS(&bb));
+    if (bb) {
+        g_dev->CreateRenderTargetView(bb, nullptr, &g_rtv);
+        bb->Release();
+    }
+    return true;
 }
 
-static void Tick() {
-    ResetTlb();
+static void CleanDev() {
+    if (g_frameWaitable) { CloseHandle(g_frameWaitable); g_frameWaitable = nullptr; }
+    if (g_rtv) { g_rtv->Release(); g_rtv = nullptr; }
+    if (g_sc)  { g_sc->Release();  g_sc = nullptr; }
+    if (g_ctx) { g_ctx->Release(); g_ctx = nullptr; }
+    if (g_dev) { g_dev->Release(); g_dev = nullptr; }
+}
 
-    static ULONG s_tickCount = 0;
-    static ULONG s_lastModuleAttempt = 0;
-    static bool  s_processLogged = false;
-    static ULONG s_emptyGraceTicks = 0;
-    ULONG tick = ++s_tickCount;
-    bool logNow = ((tick % 500) == 0);
+static void DrawKernelLogs(ImDrawList* d) {
+    SharedBlock* shm = g_shm.load(std::memory_order_acquire);
+    if (!shm) return;
+    LONG tail = shm->log.tail;
+    float y = 28.f;
+    for (int i = 1; i <= 8; ++i) {
+        LONG idx = (tail - i) % MAX_LOGS;
+        if (idx < 0) idx += MAX_LOGS;
+        const SharedLogEntry& le = shm->log.entries[idx];
+        if (!le.text[0]) continue;
+        char buf[LOG_LINE_MAX + 32];
+        _snprintf_s(buf, sizeof(buf), _TRUNCATE, "#%u %s", le.tick, le.text);
+        d->AddText({10.f, y}, IM_COL32(0, 200, 0, 220), buf);
+        y += 15.f;
+    }
+}
 
-    // 1) Поиск процесса
-    if (!g_cs2Cr3) {
-        HANDLE pid = nullptr;
-        PEPROCESS p = FindCs2Process(&pid);
-        if (!p) {
-            ClearShared();
-            if (logNow) Log("cs2.exe not found");
-            return;
+static void Render(ImDrawList* d) {
+    // Забираем новый буфер из центра только если бит 0x80 выставлен Worker'ом
+    uint32_t state = g_sharedSnapState.load(std::memory_order_acquire);
+    if (state & 0x80u) {
+        uint32_t prev = g_sharedSnapState.exchange(g_readIdx, std::memory_order_acq_rel);
+        g_readIdx = prev & 0x03u;
+    }
+    const RenderSnapshot& snap = g_snapshots[g_readIdx];
+
+    char statusLine[256];
+    _snprintf_s(statusLine, sizeof(statusLine), _TRUNCATE,
+        "shm=%s view=%s | seq=%ld entities=%u ver=%lu | W=%d H=%d [VSync ON]",
+        g_shm.load(std::memory_order_relaxed) ? "OK" : "NULL",
+        g_view.load(std::memory_order_relaxed) ? "OK" : "NULL",
+        snap.seq, snap.count, snap.ver,
+        g_W.load(std::memory_order_relaxed), g_H.load(std::memory_order_relaxed));
+    d->AddText({10.f, 8.f}, IM_COL32(0, 255, 0, 255), statusLine);
+
+    DrawKernelLogs(d);
+
+    constexpr ImU32 red   = IM_COL32(255, 0, 0, 255);
+    constexpr ImU32 white = IM_COL32(255, 255, 255, 255);
+
+    for (uint32_t i = 0; i < snap.count; ++i) {
+        const RenderReadyEntity& en = snap.ents[i];
+        for (uint32_t l = 0; l < en.lineCount; ++l) {
+            const auto& seg = en.lines[l];
+            d->AddLine({seg.x1, seg.y1}, {seg.x2, seg.y2}, red, 2.0f);
         }
-        g_cs2Cr3 = GetProcessCr3(p);
-        g_cs2Pid = pid;
-        ObDereferenceObject(p);
-        ResetTlbFull();
-
-        if (!s_processLogged) {
-            Log("process found: pid=%p cr3=%llx", g_cs2Pid, g_cs2Cr3);
-            s_processLogged = true;
-        }
-        if (!g_cs2Cr3) {
-            ClearShared();
-            return;
+        if (en.hasHead) {
+            d->AddCircle({en.headX, en.headY}, en.headRadius, white, 16, 1.5f);
+            char hpBuf[32];
+            _snprintf_s(hpBuf, sizeof(hpBuf), _TRUNCATE, "HP: %d", en.hp);
+            d->AddText({en.headX - 15.f, en.headY - en.headRadius - 15.f}, red, hpBuf);
         }
     }
+}
 
-    // 2) Поиск/перепроверка модуля client.dll
-    bool needModuleCheck = (!g_clientBase) || ((tick - s_lastModuleAttempt) >= 64);
-
-    static ULONG s_mzFailCount = 0;
-    if (g_clientBase && (tick & 0x3F) == 0) {
-        USHORT mz = 0;
-        if (!ReadCs2Memory(g_clientBase, &mz, sizeof(mz)) || mz != 0x5A4D) {
-            if (++s_mzFailCount >= 3) {
-                s_mzFailCount = 0;
-                Log("client.dll MZ check failed 3x, resetting clientBase");
-                g_clientBase = 0;          // НЕ сбрасываем g_cs2Cr3
-                ResetTlbFull();
-                needModuleCheck = true;
-            }
-        } else {
-            s_mzFailCount = 0;
-        }
-    }
-
-    if (needModuleCheck && !g_clientBase) {
-        s_lastModuleAttempt = tick;
-        PEPROCESS p = nullptr;
-        if (NT_SUCCESS(PsLookupProcessByProcessId(g_cs2Pid, &p))) {
-            bool verbose = (g_clientBase == 0);
-            g_clientBase = FindModuleBase(p, L"client.dll", verbose);
-            ObDereferenceObject(p);
-        }
-        if (g_clientBase) {
-            Log("client.dll found: base=%llx", g_clientBase);
-        } else if (logNow || (tick - s_lastModuleAttempt) < 2) {
-            Log("module rediscover: clientBase=0 (client.dll not loaded yet)");
-        }
-    }
-
-    if (!g_clientBase) {
-        ClearShared();
-        return;
-    }
-
-    // 3) Чтение данных игры (полностью ВНЕ Seqlock)
-    ULONG64 lp = 0, es = 0;
-    RdQ(g_clientBase + OFF_dwLocalPlayerPawn, &lp);
-    RdQ(g_clientBase + OFF_dwEntityList, &es);
-    g_localPawn = lp;
-    g_entitySystem = es;
-
-    ULONG vmRaw[16] = {};
-    BOOLEAN vmOk = ReadCs2Memory(g_clientBase + OFF_dwViewMatrix, vmRaw, sizeof(vmRaw));
-
-    if (!lp || !es) {
-        if (++s_emptyGraceTicks >= 8) {
-            ClearShared();
-        }
-        return;
-    }
-
-    UCHAR myTeam = 0;
-    ReadCs2Memory(lp + OFF_m_iTeamNum, &myTeam, sizeof(myTeam));
-
-    ULONG64 chunkPtrs[CACHED_CHUNKS]   = {};
-    BOOLEAN chunkValid[CACHED_CHUNKS]  = {};
-    if (g_chunkCache) {
-        for (ULONG c = 0; c < CACHED_CHUNKS; ++c) {
-            if (RdQ(es + 0x10 + 8ULL * c, &chunkPtrs[c]) && chunkPtrs[c]) {
-                chunkValid[c] = ReadCs2Memory(
-                    chunkPtrs[c],
-                    g_chunkCache + (SIZE_T)c * 512 * ENTITY_STRIDE,
-                    512 * ENTITY_STRIDE);
-            }
-        }
-    }
-
-    ULONG out = 0, ctrlOk = 0, pawnOk = 0, aliveOk = 0, boneOk = 0, maxPawn = 0;
-
-    for (ULONG i = 1; i <= 64 && out < MAX_ENTITIES; ++i) {
-        ULONG slotIdx = i - 1;
-        SlotPtrCache& sc = g_slotCache[slotIdx];
-
-        ULONG64 ctrl = FastEntityByIndex(chunkPtrs, chunkValid, i);
-        if (!ctrl) {
-            sc.ctrl = 0;
-            if (g_prevEnts) g_prevEnts[slotIdx].valid = 0;
-            continue;
-        }
-        ++ctrlOk;
-
-        // Обновляем связку ctrl -> hPawn раз в 20 тиков или при смене контроллера/отсутствии павна
-        bool refreshSlot = (ctrl != sc.ctrl) || !sc.pawn || ((tick - sc.lastUpdateTick) >= 20);
-        if (refreshSlot) {
-            ULONG hPawn = 0;
-            if (!RdD(ctrl + OFF_m_hPlayerPawn, &hPawn) || !hPawn || hPawn == 0xFFFFFFFF) {
-                sc.ctrl = ctrl;
-                sc.pawn = 0;
-                if (g_prevEnts) g_prevEnts[slotIdx].valid = 0;
-                continue;
-            }
-            sc.ctrl           = ctrl;
-            sc.hPawn          = hPawn;
-            sc.lastUpdateTick = tick - (i & 7); // размазываем обновления по тикам
-        }
-
-        ULONG pawnIdx = sc.hPawn & 0x7FFF;
-        if (pawnIdx > maxPawn) maxPawn = pawnIdx;
-
-        ULONG64 pawn = FastEntityByIndex(chunkPtrs, chunkValid, pawnIdx);
-        if (!pawn || pawn == lp) {
-            sc.pawn = 0;
-            if (g_prevEnts) g_prevEnts[slotIdx].valid = 0;
-            continue;
-        }
-        if (pawn != sc.pawn) {
-            sc.pawn  = pawn;
-            sc.scene = 0;
-            sc.bMat  = 0;
-        }
-        ++pawnOk;
-
-        if (!g_pawnScratch) continue;
-        if (!ReadCs2Memory(pawn + PAWN_BATCH_BASE, g_pawnScratch, PAWN_BATCH_SIZE)) {
-            sc.pawn = 0;
-            continue;
-        }
-
-        ULONG64 scene = *(ULONG64*)(g_pawnScratch + (OFF_m_pGameSceneNode - PAWN_BATCH_BASE));
-        int     hp    = *(int*)    (g_pawnScratch + (OFF_m_iHealth        - PAWN_BATCH_BASE));
-        UCHAR   ls    = *(UCHAR*)  (g_pawnScratch + (OFF_m_lifeState      - PAWN_BATCH_BASE));
-        UCHAR   team  = *(UCHAR*)  (g_pawnScratch + (OFF_m_iTeamNum       - PAWN_BATCH_BASE));
-
-        if (hp <= 0 || hp > 200 || ls != 0 || team == myTeam || !scene) {
-            sc.bMat = 0;
-            if (g_prevEnts) g_prevEnts[slotIdx].valid = 0;
-            continue;
-        }
-
-        ++aliveOk;
-
-        // Обновляем bMat только при смене scene, раз в 20 тиков или если bMat ещё не закэширован
-        if (scene != sc.scene || !sc.bMat || refreshSlot) {
-            ULONG64 newBMat = 0;
-            if (RdQ(scene + OFF_m_modelState + 0x80, &newBMat) && newBMat) {
-                sc.scene = scene;
-                sc.bMat  = newBMat;
-            } else {
-                sc.bMat = 0;
-            }
-        }
-
-        ULONG64 bMat = sc.bMat;
-        bool bonesReadSuccess = false;
-        if (bMat && g_bonesScratch) {
-            if (ReadCs2Memory(bMat, g_bonesScratch, MAX_BONES * 0x20)) {
-                // Проверяем, что кость головы (индекс 6 или 7) не нулевая
-                const ULONG* headBone = (const ULONG*)(g_bonesScratch + (SIZE_T)6 * 0x20);
-                if (headBone[0] != 0 || headBone[1] != 0 || headBone[2] != 0) {
-                    bonesReadSuccess = true;
+static DWORD WINAPI DiagThread(LPVOID) {
+    unsigned diagCounter = 0;
+    while (g_run.load(std::memory_order_relaxed)) {
+        if (!g_shm.load(std::memory_order_acquire)) {
+            HANDLE m = OpenFileMappingW(FILE_MAP_READ, FALSE, L"Global\\Cs2EspShared_v1");
+            if (m) {
+                auto* ptr = (SharedBlock*)MapViewOfFile(m, FILE_MAP_READ, 0, 0, sizeof(SharedBlock));
+                if (ptr) {
+                    g_map = m;
+                    g_shm.store(ptr, std::memory_order_release);
+                    LogSelf("DiagThread: OpenFileMapping(Shared) ok shm=%p", ptr);
+                } else {
+                    CloseHandle(m);
                 }
             }
-            if (!bonesReadSuccess) {
-                sc.bMat = 0; // если кости нулевые или адрес протух — сбросим кэш bMat
+        }
+        if (!g_view.load(std::memory_order_acquire)) {
+            HANDLE m = OpenFileMappingW(FILE_MAP_READ, FALSE, L"Global\\Cs2EspView_v1");
+            if (m) {
+                auto* ptr = (float*)MapViewOfFile(m, FILE_MAP_READ, 0, 0, 0x1000);
+                if (ptr) {
+                    g_viewMap = m;
+                    g_view.store(ptr, std::memory_order_release);
+                    LogSelf("DiagThread: OpenFileMapping(View) ok view=%p", ptr);
+                } else {
+                    CloseHandle(m);
+                }
             }
         }
 
-        if (bonesReadSuccess && g_localEnts) {
-            ++boneOk;
-            SHARED_ENTITY& dst = g_localEnts[out];
-            dst.valid = 1;
-            dst.hp    = hp;
-            dst.team  = (int)team;
-            dst.pad0  = 0;
-            for (ULONG b = 0; b < MAX_BONES; ++b) {
-                const ULONG* srcBone = (const ULONG*)(g_bonesScratch + (SIZE_T)b * 0x20);
-                dst.bones[b].xBits = srcBone[0];
-                dst.bones[b].yBits = srcBone[1];
-                dst.bones[b].zBits = srcBone[2];
+        DrainKernelLogs();
+
+        if (++diagCounter >= 5) {
+            diagCounter = 0;
+            SharedBlock* shm = g_shm.load(std::memory_order_relaxed);
+            if (shm) {
+                LogSelf("diag: seq=%ld entities=%lu ver=%lu logTail=%ld",
+                        shm->hdr.seq, shm->hdr.entityCount, shm->hdr.version, shm->log.tail);
             }
-            if (g_prevEnts) {
-                RtlCopyMemory(&g_prevEnts[slotIdx], &dst, sizeof(SHARED_ENTITY));
+        }
+        Sleep(5000);
+    }
+    return 0;
+}
+
+static DWORD WINAPI OverlayThread(LPVOID) {
+    Sleep(3000);
+
+    const int w = GetSystemMetrics(SM_CXSCREEN);
+    const int h = GetSystemMetrics(SM_CYSCREEN);
+    g_W.store(w, std::memory_order_relaxed);
+    g_H.store(h, std::memory_order_relaxed);
+
+    WNDCLASSEXW wc = { sizeof(wc), CS_CLASSDC, WndProc, 0, 0, GetModuleHandleW(nullptr),
+                       LoadIcon(nullptr, IDI_APPLICATION), LoadCursor(nullptr, IDC_ARROW),
+                       nullptr, nullptr, L"DiscordOvClass", nullptr };
+    RegisterClassExW(&wc);
+
+    g_hWnd = CreateWindowExW(
+        WS_EX_TOPMOST | WS_EX_TRANSPARENT | WS_EX_LAYERED | WS_EX_APPWINDOW | WS_EX_NOACTIVATE,
+        wc.lpszClassName, L"Discord Overlay", WS_POPUP, 0, 0, w, h,
+        nullptr, nullptr, wc.hInstance, nullptr);
+    if (!g_hWnd) return 0;
+
+    MARGINS m = { -1 };
+    DwmExtendFrameIntoClientArea(g_hWnd, &m);
+    SetLayeredWindowAttributes(g_hWnd, 0, 255, LWA_ALPHA);
+    SetWindowDisplayAffinity(g_hWnd, 0x11);
+
+    if (!CreateDev(g_hWnd)) {
+        CleanDev();
+        DestroyWindow(g_hWnd);
+        return 0;
+    }
+    ShowWindow(g_hWnd, SW_SHOW);
+
+    IMGUI_CHECKVERSION();
+    ImGui::CreateContext();
+    ImGui::GetIO().IniFilename = nullptr;
+    ImGui_ImplWin32_Init(g_hWnd);
+    ImGui_ImplDX11_Init(g_dev, g_ctx);
+
+    MSG msg = {};
+    while (g_run.load(std::memory_order_relaxed)) {
+        while (PeekMessageW(&msg, nullptr, 0, 0, PM_REMOVE)) {
+            if (msg.message == WM_QUIT) {
+                g_run.store(false, std::memory_order_release);
+                break;
             }
-            ++out;
-        } else if (g_prevEnts && g_prevEnts[slotIdx].valid && g_localEnts) {
-            // Если на этом тике чтение костей сорвалось, используем кэш прошлого тика для этого слота
-            SHARED_ENTITY& dst = g_localEnts[out];
-            RtlCopyMemory(&dst, &g_prevEnts[slotIdx], sizeof(SHARED_ENTITY));
-            dst.hp   = hp;
-            dst.team = (int)team;
-            ++out;
+            TranslateMessage(&msg);
+            DispatchMessageW(&msg);
+        }
+        if (!g_run.load(std::memory_order_relaxed)) break;
+
+        ImGui_ImplDX11_NewFrame();
+        ImGui_ImplWin32_NewFrame();
+        ImGui::NewFrame();
+
+        ImGui::SetNextWindowSize({(float)w, (float)h});
+        ImGui::SetNextWindowPos({0.f, 0.f});
+        ImGui::Begin("ov", nullptr,
+            ImGuiWindowFlags_NoTitleBar | ImGuiWindowFlags_NoResize |
+            ImGuiWindowFlags_NoScrollbar | ImGuiWindowFlags_NoCollapse |
+            ImGuiWindowFlags_NoBackground | ImGuiWindowFlags_NoInputs |
+            ImGuiWindowFlags_NoSavedSettings);
+
+        Render(ImGui::GetWindowDrawList());
+
+        ImGui::End();
+        ImGui::Render();
+
+        constexpr float clr[4] = {0.f, 0.f, 0.f, 0.f};
+        g_ctx->OMSetRenderTargets(1, &g_rtv, nullptr);
+        g_ctx->ClearRenderTargetView(g_rtv, clr);
+        ImGui_ImplDX11_RenderDrawData(ImGui::GetDrawData());
+
+        HRESULT hr = g_sc->Present(1, 0);
+        if (hr == DXGI_STATUS_OCCLUDED) {
+            DwmFlush();
         }
     }
 
-    if (out == 0) {
-        if (++s_emptyGraceTicks < 8) {
-            if (vmOk && g_viewVa && g_sharedVa) {
-                InterlockedIncrement(&g_sharedVa->hdr.seq);
-                KeMemoryBarrier();
-                RtlCopyMemory(g_viewVa, vmRaw, sizeof(vmRaw));
-                KeMemoryBarrier();
-                InterlockedIncrement(&g_sharedVa->hdr.seq);
-            }
-            return;
+    ImGui_ImplDX11_Shutdown();
+    ImGui_ImplWin32_Shutdown();
+    ImGui::DestroyContext();
+    CleanDev();
+    DestroyWindow(g_hWnd);
+    UnregisterClassW(wc.lpszClassName, wc.hInstance);
+    return 0;
+}
+
+static DWORD WINAPI InitThread(LPVOID) {
+    LogOpen();
+    LoadReal();
+
+    HANDLE mShared = OpenFileMappingW(FILE_MAP_READ, FALSE, L"Global\\Cs2EspShared_v1");
+    if (mShared) {
+        auto* ptr = (SharedBlock*)MapViewOfFile(mShared, FILE_MAP_READ, 0, 0, sizeof(SharedBlock));
+        if (ptr) {
+            g_map = mShared;
+            g_shm.store(ptr, std::memory_order_release);
+        } else {
+            CloseHandle(mShared);
         }
-    } else {
-        s_emptyGraceTicks = 0;
     }
 
-    // 4) Мгновенное копирование готового буфера под Seqlock
-    if (g_sharedVa && g_localEnts) {
-        InterlockedIncrement(&g_sharedVa->hdr.seq);
-        KeMemoryBarrier();
-
-        if (vmOk && g_viewVa) {
-            RtlCopyMemory(g_viewVa, vmRaw, sizeof(vmRaw));
+    HANDLE mView = OpenFileMappingW(FILE_MAP_READ, FALSE, L"Global\\Cs2EspView_v1");
+    if (mView) {
+        auto* ptr = (float*)MapViewOfFile(mView, FILE_MAP_READ, 0, 0, 0x1000);
+        if (ptr) {
+            g_viewMap = mView;
+            g_view.store(ptr, std::memory_order_release);
+        } else {
+            CloseHandle(mView);
         }
-        if (out > 0) {
-            RtlCopyMemory(g_sharedVa->ents, g_localEnts, (SIZE_T)out * sizeof(SHARED_ENTITY));
-        }
-        g_sharedVa->hdr.entityCount = out;
-        g_sharedVa->hdr.version = 1;
-
-        KeMemoryBarrier();
-        InterlockedIncrement(&g_sharedVa->hdr.seq);
     }
 
-    if (logNow) {
-        Log("tick: ctrl=%u pawn=%u alive=%u bone=%u out=%u maxPawn=%u reads=%u fails=%u",
-            ctrlOk, pawnOk, aliveOk, boneOk, out, maxPawn,
-            (ULONG)g_statReads, (ULONG)g_statReadFails);
-    }
+    CreateThread(nullptr, 0, DiagThread, nullptr, 0, nullptr);
+    CreateThread(nullptr, 0, AsyncDataWorkerThread, nullptr, 0, nullptr);
+
+    OverlayThread(nullptr);
+    return 0;
 }
 
-static VOID WorkerThread(PVOID) {
-    KeSetPriorityThread(KeGetCurrentThread(), 8);   // 8 = NORMAL_PRIORITY в терминах ядра
-
-    LARGE_INTEGER interval;
-    interval.QuadPart = -20000LL;  // 2 мс = 500 Гц ровно
-
-    for (;;) {
-        if (InterlockedCompareExchange(&g_stop, 0, 0)) break;
-        Tick();
-        KeWaitForSingleObject(&g_workerEvent, Executive, KernelMode, FALSE, &interval);
+BOOL WINAPI DllMain(HINSTANCE h, DWORD r, LPVOID) {
+    if (r == DLL_PROCESS_ATTACH) {
+        DisableThreadLibraryCalls(h);
+        CreateThread(nullptr, 0, InitThread, nullptr, 0, nullptr);
+    } else if (r == DLL_PROCESS_DETACH) {
+        g_run.store(false, std::memory_order_release);
     }
-    PsTerminateSystemThread(STATUS_SUCCESS);
-}
-
-static NTSTATUS BuildSafeSd(PSECURITY_DESCRIPTOR sd) {
-    NTSTATUS st = RtlCreateSecurityDescriptor(sd, SECURITY_DESCRIPTOR_REVISION);
-    if (!NT_SUCCESS(st)) return st;
-    return RtlSetDaclSecurityDescriptor(sd, TRUE, NULL, FALSE);
-}
-
-static NTSTATUS OpenOrCreateSection(PCWSTR nameStr, HANDLE* outHandle, LARGE_INTEGER size) {
-    UNICODE_STRING name;
-    OBJECT_ATTRIBUTES oa;
-    SECURITY_DESCRIPTOR sd;
-
-    NTSTATUS st = BuildSafeSd(&sd);
-    if (!NT_SUCCESS(st)) return st;
-
-    RtlInitUnicodeString(&name, nameStr);
-    InitializeObjectAttributes(&oa, &name, OBJ_CASE_INSENSITIVE | OBJ_KERNEL_HANDLE, nullptr, &sd);
-
-    st = ZwCreateSection(outHandle, SECTION_ALL_ACCESS, &oa, &size, PAGE_READWRITE, SEC_COMMIT, nullptr);
-    if (st == STATUS_OBJECT_NAME_COLLISION) {
-        InitializeObjectAttributes(&oa, &name, OBJ_CASE_INSENSITIVE | OBJ_KERNEL_HANDLE, nullptr, nullptr);
-        st = ZwOpenSection(outHandle, SECTION_ALL_ACCESS, &oa);
-    }
-    return st;
-}
-
-static NTSTATUS MapSectionSystem(HANDLE h, SIZE_T size, PVOID* outVa, PVOID* outObj) {
-    PVOID obj = nullptr;
-    NTSTATUS st = ObReferenceObjectByHandle(h, SECTION_MAP_READ | SECTION_MAP_WRITE,
-                                            nullptr, KernelMode, &obj, nullptr);
-    if (!NT_SUCCESS(st)) return st;
-
-    PVOID base = nullptr;
-    SIZE_T vs = size;
-    st = MmMapViewInSystemSpace(obj, &base, &vs);
-    if (!NT_SUCCESS(st)) {
-        ObDereferenceObject(obj);
-        return st;
-    }
-
-    *outVa = base;
-    *outObj = obj;
-    return STATUS_SUCCESS;
-}
-
-static void UnmapSectionSystem(PVOID* va, PVOID* obj) {
-    if (*va)  { MmUnmapViewInSystemSpace(*va); *va = nullptr; }
-    if (*obj) { ObDereferenceObject(*obj);     *obj = nullptr; }
-}
-
-static NTSTATUS CreateShared() {
-    NTSTATUS st;
-    LARGE_INTEGER sz;
-    PVOID base = nullptr;
-    SECTION_BASIC_INFORMATION sbi = {};
-
-    if (!g_sharedVa) {
-        sz.QuadPart = sizeof(SHARED_BLOCK);
-        st = OpenOrCreateSection(L"\\BaseNamedObjects\\Cs2EspShared_v1", &g_hSharedSection, sz);
-        if (!NT_SUCCESS(st)) return st;
-
-        RtlZeroMemory(&sbi, sizeof(sbi));
-        st = ZwQuerySection(g_hSharedSection, SectionBasicInformation, &sbi, sizeof(sbi), nullptr);
-        if (NT_SUCCESS(st) && sbi.Size.QuadPart < (LONGLONG)sizeof(SHARED_BLOCK)) {
-            ZwClose(g_hSharedSection);
-            g_hSharedSection = nullptr;
-            return STATUS_INVALID_PARAMETER;
-        }
-
-        st = MapSectionSystem(g_hSharedSection, sizeof(SHARED_BLOCK), &base, &g_sharedSecObj);
-        if (!NT_SUCCESS(st)) return st;
-
-        g_sharedVa = (SHARED_BLOCK*)base;
-        g_sharedVa->hdr.version = 1;
-        g_sharedVa->hdr.maxEntities = MAX_ENTITIES;   // 64
-    }
-
-    if (!g_viewVa) {
-        sz.QuadPart = 0x1000;
-        st = OpenOrCreateSection(L"\\BaseNamedObjects\\Cs2EspView_v1", &g_hViewSection, sz);
-        if (!NT_SUCCESS(st)) return st;
-
-        st = MapSectionSystem(g_hViewSection, 0x1000, &base, &g_viewSecObj);
-        if (!NT_SUCCESS(st)) return st;
-
-        g_viewVa = (ULONG*)base;
-    }
-
-    return STATUS_SUCCESS;
-}
-
-static void DestroyShared() {
-    UnmapSectionSystem((PVOID*)&g_viewVa, &g_viewSecObj);
-    if (g_hViewSection)   { ZwClose(g_hViewSection);   g_hViewSection = nullptr; }
-    UnmapSectionSystem((PVOID*)&g_sharedVa, &g_sharedSecObj);
-    if (g_hSharedSection) { ZwClose(g_hSharedSection); g_hSharedSection = nullptr; }
-    if (g_chunkCache)     { ExFreePoolWithTag(g_chunkCache, POOL_TAG); g_chunkCache = nullptr; }
-    if (g_bonesScratch)   { ExFreePoolWithTag(g_bonesScratch, POOL_TAG); g_bonesScratch = nullptr; }
-    if (g_pawnScratch)    { ExFreePoolWithTag(g_pawnScratch, POOL_TAG); g_pawnScratch = nullptr; }
-    if (g_localEnts)      { ExFreePoolWithTag(g_localEnts, POOL_TAG); g_localEnts = nullptr; }
-    if (g_prevEnts)       { ExFreePoolWithTag(g_prevEnts, POOL_TAG); g_prevEnts = nullptr; }
-}
-
-static VOID DriverUnloadFn(PDRIVER_OBJECT) {
-    InterlockedExchange(&g_stop, 1);
-    KeSetEvent(&g_workerEvent, 0, FALSE);
-    if (g_workerThread) {
-        KeWaitForSingleObject(g_workerThread, Executive, KernelMode, FALSE, nullptr);
-        ObDereferenceObject(g_workerThread);
-        g_workerThread = nullptr;
-    }
-    DestroyShared();
-
-    // ВАЖНО: восстанавливаем стандартную частоту системного таймера.
-    // Если этого не сделать, после выгрузки драйвера таймер останется на 0.5 мс,
-    // что повышает энергопотребление всей системы (ноутбуки/батарея).
-    ExSetTimerResolution(0, FALSE);
-}
-
-extern "C" NTSTATUS DriverEntry(PDRIVER_OBJECT drv, PUNICODE_STRING) {
-    g_hSharedSection = nullptr; g_sharedSecObj = nullptr; g_sharedVa = nullptr;
-    g_hViewSection   = nullptr; g_viewSecObj   = nullptr; g_viewVa   = nullptr;
-    g_cs2Cr3 = 0; g_clientBase = 0; g_cs2Pid = nullptr;
-    g_localPawn = 0; g_entitySystem = 0;
-    g_stop = 0; g_workerThread = nullptr;
-    g_logTick = 0; g_statReads = 0; g_statReadFails = 0;
-    g_chunkCache = nullptr;
-    g_bonesScratch = nullptr;
-    g_pawnScratch = nullptr;
-    g_localEnts = nullptr;
-    g_prevEnts = nullptr;
-    RtlZeroMemory(g_slotCache, sizeof(g_slotCache));
-    ResetTlbFull();
-
-    g_chunkCache = (UCHAR*)ExAllocatePool2(POOL_FLAG_NON_PAGED,
-                                           CACHED_CHUNKS * 512 * ENTITY_STRIDE, POOL_TAG);
-    if (!g_chunkCache) return STATUS_INSUFFICIENT_RESOURCES;
-
-    g_bonesScratch = (UCHAR*)ExAllocatePool2(POOL_FLAG_NON_PAGED, MAX_BONES * 0x20, POOL_TAG);
-    if (!g_bonesScratch) { DestroyShared(); return STATUS_INSUFFICIENT_RESOURCES; }
-
-    g_pawnScratch = (UCHAR*)ExAllocatePool2(POOL_FLAG_NON_PAGED, PAWN_BATCH_SIZE, POOL_TAG);
-    if (!g_pawnScratch) { DestroyShared(); return STATUS_INSUFFICIENT_RESOURCES; }
-
-    g_localEnts = (SHARED_ENTITY*)ExAllocatePool2(POOL_FLAG_NON_PAGED,
-                                                  sizeof(SHARED_ENTITY) * MAX_ENTITIES, POOL_TAG);
-    if (!g_localEnts) { DestroyShared(); return STATUS_INSUFFICIENT_RESOURCES; }
-
-    g_prevEnts = (SHARED_ENTITY*)ExAllocatePool2(POOL_FLAG_NON_PAGED,
-                                                 sizeof(SHARED_ENTITY) * MAX_ENTITIES, POOL_TAG);
-    if (!g_prevEnts) { DestroyShared(); return STATUS_INSUFFICIENT_RESOURCES; }
-    RtlZeroMemory(g_prevEnts, sizeof(SHARED_ENTITY) * MAX_ENTITIES);
-
-    NTSTATUS st = CreateShared();
-    if (!NT_SUCCESS(st)) {
-        DestroyShared();
-        return st;
-    }
-
-    ULONG curRes = ExSetTimerResolution(10000, TRUE);  // 1 мс (не 0.5)
-
-    KeInitializeEvent(&g_workerEvent, NotificationEvent, FALSE);
-
-    HANDLE h = nullptr;
-    st = PsCreateSystemThread(&h, THREAD_ALL_ACCESS, nullptr, nullptr, nullptr, WorkerThread, nullptr);
-    if (!NT_SUCCESS(st)) {
-        DestroyShared();
-        return st;
-    }
-
-    st = ObReferenceObjectByHandle(h, THREAD_ALL_ACCESS, *PsThreadType, KernelMode,
-                                   (PVOID*)&g_workerThread, nullptr);
-    ZwClose(h);
-    if (!NT_SUCCESS(st)) {
-        InterlockedExchange(&g_stop, 1);
-        KeSetEvent(&g_workerEvent, 0, FALSE);
-        return st;
-    }
-
-    Log("DriverEntry ok (MmCopyMemory PHYSICAL + Batch Read, res=%u): shared=%p view=%p",
-        curRes, g_sharedVa, g_viewVa);
-
-    if (drv) drv->DriverUnload = DriverUnloadFn;
-    return STATUS_SUCCESS;
+    return TRUE;
 }
