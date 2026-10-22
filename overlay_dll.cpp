@@ -31,7 +31,7 @@
 // ===========================================================================
 // Контракт Shared Memory (1-в-1 с esp_drv.cpp)
 // ===========================================================================
-constexpr int MAX_ENTITIES = 64;
+constexpr int MAX_ENTITIES = 256;
 constexpr int MAX_BONES    = 24;
 constexpr int MAX_LOGS     = 256;
 constexpr int LOG_LINE_MAX = 128;
@@ -494,7 +494,7 @@ static DWORD WINAPI DiagThread(LPVOID) {
                         shm->hdr.seq, shm->hdr.entityCount, shm->hdr.version, shm->log.tail);
             }
         }
-        Sleep(15000);   // раз в 15 сек вместо 5
+        Sleep(5000);
     }
     return 0;
 }
@@ -521,7 +521,6 @@ static DWORD WINAPI OverlayThread(LPVOID) {
     MARGINS m = { -1 };
     DwmExtendFrameIntoClientArea(g_hWnd, &m);
     SetLayeredWindowAttributes(g_hWnd, 0, 255, LWA_ALPHA);
-    SetWindowDisplayAffinity(g_hWnd, 0x11);
 
     if (!CreateDev(g_hWnd)) {
         CleanDev();
