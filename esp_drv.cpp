@@ -117,7 +117,8 @@ static volatile LONG g_statReads      = 0;
 static volatile LONG g_statReadFails  = 0;
 
 // ---- Локальный кэш трансляции адресов (Direct-mapped TLB 256 + PML4) ----
-constexpr ULONG TLB_SIZE = 256;
+constexpr ULONG TLB_SIZE     = 256;
+constexpr ULONG PML4_MAX_AGE = 64;   // ~128 мс при 500 Гц
 
 struct TlbEntry {
     ULONG64 vaPage;
@@ -128,12 +129,13 @@ struct TranslationCache {
     TlbEntry entries[TLB_SIZE];
     ULONG64  pml4[512];
     BOOLEAN  pml4Valid;
+    ULONG    pml4Age;
 };
 
 static TranslationCache g_tlb;
 
 // Вызывается каждый тик: сбрасывает только страницы, НЕ трогая PML4
-static __forceinline void ResetTlb() {
+static __forceinline void ResetTlbPages() {
     for (ULONG i = 0; i < TLB_SIZE; ++i) {
         g_tlb.entries[i].vaPage   = ~0ULL;
         g_tlb.entries[i].physPage = 0;
@@ -142,8 +144,9 @@ static __forceinline void ResetTlb() {
 
 // Вызывается при смене CR3, ошибке чтения или старте драйвера
 static __forceinline void ResetTlbFull() {
-    ResetTlb();
+    ResetTlbPages();
     g_tlb.pml4Valid = FALSE;
+    g_tlb.pml4Age   = 0;
 }
 
 // ---------------------------------------------------------------------------
@@ -262,6 +265,7 @@ static __forceinline ULONG64 VirtualToPhysical(ULONG64 cr3, ULONG64 va) {
     if (!g_tlb.pml4Valid) {
         if (ReadPhysicalCached(cr3 & PHYS_MASK_4K, g_tlb.pml4, sizeof(g_tlb.pml4))) {
             g_tlb.pml4Valid = TRUE;
+            g_tlb.pml4Age   = 0;
         }
     }
 
@@ -514,7 +518,15 @@ static __forceinline ULONG64 FastEntityByIndex(const ULONG64* chunkPtrs,
 }
 
 static void Tick() {
-    ResetTlb();
+    // 1) Стареем PML4; при превышении — инвалидируем (перечитается при следующем walk)
+    if (g_tlb.pml4Valid) {
+        if (++g_tlb.pml4Age >= PML4_MAX_AGE) {
+            g_tlb.pml4Valid = FALSE;
+            g_tlb.pml4Age   = 0;
+        }
+    }
+    // 2) Страницы сбрасываем каждый тик (они меняются чаще)
+    ResetTlbPages();
 
     static ULONG s_tickCount = 0;
     static ULONG s_lastModuleAttempt = 0;
