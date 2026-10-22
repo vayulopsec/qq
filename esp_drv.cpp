@@ -1,66 +1,111 @@
-// min_reader.cpp — минимальный драйвер: cs2.exe -> client.dll -> dwLocalPlayerPawn
-// Логирует в C:\Users\Public\Desktop\min_reader.log (через ZwWriteFile)
+// min_reader.cpp — kdmapper-friendly minimal CS2 reader
 // build: MSVC + WDK, /std:c++20 /kernel /O2 /GS- /GR- /EHs-c- /EHc- /Zl
+// Load: kdmapper min_reader.sys
+// Log:  C:\Users\Public\Desktop\min_reader.log
 
 #include <ntifs.h>
 #include <ntddk.h>
 #include <stdarg.h>
 
-extern "C" NTSTATUS ZwQuerySystemInformation(ULONG, PVOID, ULONG, PULONG);
-extern "C" NTSTATUS ZwCreateFile(PHANDLE, ACCESS_MASK, POBJECT_ATTRIBUTES, PIO_STATUS_BLOCK,
-                                 PLARGE_INTEGER, ULONG, ULONG, ULONG, ULONG, PVOID, ULONG);
-extern "C" NTSTATUS ZwWriteFile(HANDLE, HANDLE, PIO_APC_ROUTINE, PVOID, PIO_STATUS_BLOCK,
-                                PVOID, ULONG, PLARGE_INTEGER, PULONG);
-extern "C" NTSTATUS ZwClose(HANDLE);
+// ============================================================================
+// Резолвим все нужные функции через MmGetSystemRoutineAddress,
+// чтобы kdmapper не зависел от IAT.
+// ============================================================================
+typedef NTSTATUS (NTAPI* fnZwQuerySystemInformation)(ULONG, PVOID, ULONG, PULONG);
+typedef NTSTATUS (NTAPI* fnZwCreateFile)(PHANDLE, ACCESS_MASK, POBJECT_ATTRIBUTES,
+                                         PIO_STATUS_BLOCK, PLARGE_INTEGER, ULONG, ULONG,
+                                         ULONG, ULONG, PVOID, ULONG);
+typedef NTSTATUS (NTAPI* fnZwWriteFile)(HANDLE, HANDLE, PIO_APC_ROUTINE, PVOID,
+                                        PIO_STATUS_BLOCK, PVOID, ULONG, PLARGE_INTEGER, PULONG);
+typedef NTSTATUS (NTAPI* fnZwClose)(HANDLE);
+typedef PVOID    (NTAPI* fnPsGetProcessPeb)(PEPROCESS);
+typedef NTSTATUS (NTAPI* fnPsLookupProcessByProcessId)(HANDLE, PEPROCESS*);
+typedef NTSTATUS (NTAPI* fnMmCopyMemory)(PVOID, MM_COPY_ADDRESS, SIZE_T, ULONG, PSIZE_T);
 
-constexpr ULONG   POOL_TAG = 'rdmN';
-constexpr ULONG64 OFF_dwLocalPlayerPawn = 0x2565718ULL;
-constexpr ULONG64 PHYS_MASK_4K = 0x000FFFFFFFFFF000ULL;
-constexpr ULONG64 PHYS_MASK_2M = 0x000FFFFFFFE00000ULL;
-constexpr ULONG64 PHYS_MASK_1G = 0x000FFFFFC0000000ULL;
-constexpr ULONG64 USER_VA_MAX  = 0x800000000000ULL;
+static fnZwQuerySystemInformation      pZwQuerySystemInformation      = nullptr;
+static fnZwCreateFile                  pZwCreateFile                  = nullptr;
+static fnZwWriteFile                   pZwWriteFile                   = nullptr;
+static fnZwClose                       pZwClose                       = nullptr;
+static fnPsGetProcessPeb               pPsGetProcessPeb               = nullptr;
+static fnPsLookupProcessByProcessId    pPsLookupProcessByProcessId    = nullptr;
+static fnMmCopyMemory                  pMmCopyMemory                  = nullptr;
 
-static ULONG64 g_cr3        = 0;
-static ULONG64 g_clientBase = 0;
-static HANDLE  g_pid        = nullptr;
-static volatile LONG g_stop = 0;
-static KEVENT  g_evt;
-static PKTHREAD g_thread    = nullptr;
+static void* ResolveRoutine(const wchar_t* name) {
+    UNICODE_STRING us;
+    RtlInitUnicodeString(&us, name);
+    return MmGetSystemRoutineAddress(&us);
+}
+
+static bool ResolveImports() {
+    pZwQuerySystemInformation   = (fnZwQuerySystemInformation)  ResolveRoutine(L"ZwQuerySystemInformation");
+    pZwCreateFile               = (fnZwCreateFile)              ResolveRoutine(L"ZwCreateFile");
+    pZwWriteFile                = (fnZwWriteFile)               ResolveRoutine(L"ZwWriteFile");
+    pZwClose                    = (fnZwClose)                   ResolveRoutine(L"ZwClose");
+    pPsGetProcessPeb            = (fnPsGetProcessPeb)           ResolveRoutine(L"PsGetProcessPeb");
+    pPsLookupProcessByProcessId = (fnPsLookupProcessByProcessId)ResolveRoutine(L"PsLookupProcessByProcessId");
+    pMmCopyMemory               = (fnMmCopyMemory)              ResolveRoutine(L"MmCopyMemory");
+    return pZwQuerySystemInformation && pZwCreateFile && pZwWriteFile && pZwClose &&
+           pPsGetProcessPeb && pPsLookupProcessByProcessId && pMmCopyMemory;
+}
 
 // ============================================================================
-// Файловый лог (kernel-mode, ZwCreateFile/ZwWriteFile)
+// Константы
 // ============================================================================
-static HANDLE  g_logFile = nullptr;
-static KSPIN_LOCK g_logLock;
-static ULONG   g_logOff = 0;
+constexpr ULONG   POOL_TAG               = 'rdmN';
+constexpr ULONG64 OFF_dwLocalPlayerPawn  = 0x2565718ULL;
+constexpr ULONG64 PHYS_MASK_4K           = 0x000FFFFFFFFFF000ULL;
+constexpr ULONG64 PHYS_MASK_2M           = 0x000FFFFFFFE00000ULL;
+constexpr ULONG64 PHYS_MASK_1G           = 0x000FFFFFC0000000ULL;
+constexpr ULONG64 USER_VA_MAX            = 0x800000000000ULL;
+
+// ============================================================================
+// Глобалы
+// ============================================================================
+static ULONG64      g_cr3         = 0;
+static ULONG64      g_clientBase  = 0;
+static ULONG64      g_peb         = 0;
+static HANDLE       g_pid         = nullptr;
+static volatile LONG g_stop       = 0;
+static KEVENT       g_evt;
+static PKTHREAD     g_thread      = nullptr;
+
+// ============================================================================
+// Файловый лог (FAST_MUTEX — работает на PASSIVE_LEVEL, ZwWriteFile ок)
+// ============================================================================
+static HANDLE       g_logFile = nullptr;
+static FAST_MUTEX   g_logMutex;
+static ULONG        g_logOff  = 0;
+static bool         g_logReady = false;
 
 static void LogOpen() {
+    if (!pZwCreateFile) return;
+
     UNICODE_STRING path;
     OBJECT_ATTRIBUTES oa;
     IO_STATUS_BLOCK iosb;
-    // Public Desktop — доступен всем, без прав пользователя
     RtlInitUnicodeString(&path, L"\\??\\C:\\Users\\Public\\Desktop\\min_reader.log");
     InitializeObjectAttributes(&oa, &path, OBJ_CASE_INSENSITIVE | OBJ_KERNEL_HANDLE,
                                nullptr, nullptr);
 
     LARGE_INTEGER alloc;
-    alloc.QuadPart = 1 << 20; // 1 MB
-    NTSTATUS st = ZwCreateFile(
-        &g_logFile,
-        GENERIC_WRITE | SYNCHRONIZE,
-        &oa, &iosb, &alloc, FILE_ATTRIBUTE_NORMAL,
-        FILE_SHARE_READ | FILE_SHARE_WRITE,
+    alloc.QuadPart = 1 << 20;
+
+    NTSTATUS st = pZwCreateFile(
+        &g_logFile, GENERIC_WRITE | SYNCHRONIZE, &oa, &iosb, &alloc,
+        FILE_ATTRIBUTE_NORMAL, FILE_SHARE_READ | FILE_SHARE_WRITE,
         FILE_OVERWRITE_IF, FILE_SYNCHRONOUS_IO_NONALERT, nullptr, 0);
     if (!NT_SUCCESS(st)) {
         DbgPrint("[min] LogOpen fail 0x%08lX\n", (unsigned long)st);
         g_logFile = nullptr;
         return;
     }
-    g_logOff = 0;
+    g_logOff  = 0;
+    g_logReady = true;
 }
 
 static void LogClose() {
-    if (g_logFile) { ZwClose(g_logFile); g_logFile = nullptr; }
+    if (g_logFile && pZwClose) { pZwClose(g_logFile); g_logFile = nullptr; }
+    g_logReady = false;
 }
 
 static char* AppendStr(char* p, char* end, const char* s) {
@@ -72,7 +117,11 @@ static char* AppendStr(char* p, char* end, const char* s) {
 static char* AppendHex(char* p, char* end, unsigned long long v) {
     char tmp[32]; int n = 0;
     if (v == 0) tmp[n++] = '0';
-    while (v && n < (int)sizeof(tmp)) { int d = (int)(v & 0xF); tmp[n++] = (char)(d < 10 ? '0' + d : 'a' + d - 10); v >>= 4; }
+    while (v && n < (int)sizeof(tmp)) {
+        int d = (int)(v & 0xF);
+        tmp[n++] = (char)(d < 10 ? '0' + d : 'a' + d - 10);
+        v >>= 4;
+    }
     while (n > 0 && p < end) *p++ = tmp[--n];
     return p;
 }
@@ -101,13 +150,14 @@ static void Log(const char* fmt, ...) {
         bool ll = (l >= 2);
         if (*fmt == 'x' || *fmt == 'X') {
             ++fmt;
-            unsigned long long v = ll ? va_arg(ap, unsigned long long) : (unsigned long long)va_arg(ap, unsigned int);
+            unsigned long long v = ll ? va_arg(ap, unsigned long long)
+                                      : (unsigned long long)va_arg(ap, unsigned int);
             p = AppendHex(p, end, v);
         } else if (*fmt == 'u') {
             ++fmt;
-            unsigned long long v = ll ? va_arg(ap, unsigned long long) : (unsigned long long)va_arg(ap, unsigned int);
-            p = AppendHex(p, end, 0); // заглушка
-            (void)v;
+            unsigned long long v = ll ? va_arg(ap, unsigned long long)
+                                      : (unsigned long long)va_arg(ap, unsigned int);
+            p = AppendInt(p, end, (long long)v);
         } else if (*fmt == 'd' || *fmt == 'i') {
             ++fmt;
             long long v = ll ? va_arg(ap, long long) : (long long)va_arg(ap, int);
@@ -121,7 +171,7 @@ static void Log(const char* fmt, ...) {
             p = AppendStr(p, end, va_arg(ap, const char*));
         } else {
             if (p < end) *p++ = '%';
-            if (*fmt) { if (p < end) *p++ = *fmt++; }
+            if (*fmt && p < end) *p++ = *fmt++;
         }
     }
     va_end(ap);
@@ -131,31 +181,34 @@ static void Log(const char* fmt, ...) {
 
     DbgPrint("[min] %s", buf);
 
-    if (!g_logFile) return;
-    KIRQL irql = KeAcquireSpinLockRaiseToDpc(&g_logLock);
+    if (!g_logReady || !g_logFile || !pZwWriteFile) return;
+
+    KeEnterCriticalRegion();
+    ExAcquireFastMutex(&g_logMutex);
     if (g_logFile) {
         IO_STATUS_BLOCK iosb;
         LARGE_INTEGER off;
         off.QuadPart = g_logOff;
-        ULONG written = 0;
-        NTSTATUS st = ZwWriteFile(g_logFile, nullptr, nullptr, nullptr, &iosb,
-                                  buf, (ULONG)(p - buf), &off, nullptr);
+        NTSTATUS st = pZwWriteFile(g_logFile, nullptr, nullptr, nullptr, &iosb,
+                                   buf, (ULONG)(p - buf), &off, nullptr);
         if (NT_SUCCESS(st)) g_logOff += (ULONG)(p - buf);
     }
-    KeReleaseSpinLock(&g_logLock, irql);
+    ExReleaseFastMutex(&g_logMutex);
+    KeLeaveCriticalRegion();
 }
 
 // ============================================================================
 // Физическое чтение
 // ============================================================================
 static BOOLEAN ReadPhys(ULONG64 phys, PVOID buf, SIZE_T size) {
-    if (!phys || !buf || !size) return FALSE;
+    if (!phys || !buf || !size || !pMmCopyMemory) return FALSE;
     MM_COPY_ADDRESS src = {};
     PHYSICAL_ADDRESS pa = {};
     SIZE_T copied = 0;
     pa.QuadPart = (LONGLONG)phys;
     src.PhysicalAddress = pa;
-    return NT_SUCCESS(MmCopyMemory(buf, src, size, MM_COPY_MEMORY_PHYSICAL, &copied)) && copied == size;
+    return NT_SUCCESS(pMmCopyMemory(buf, src, size, MM_COPY_MEMORY_PHYSICAL, &copied))
+           && copied == size;
 }
 
 static ULONG64 ReadPhysQ(ULONG64 phys) {
@@ -164,9 +217,6 @@ static ULONG64 ReadPhysQ(ULONG64 phys) {
     return v;
 }
 
-// ============================================================================
-// VA -> PA (без кэша)
-// ============================================================================
 static ULONG64 VirtToPhys(ULONG64 cr3, ULONG64 va) {
     ULONG64 pml4e = ReadPhysQ((cr3 & PHYS_MASK_4K) + 8ULL * ((va >> 39) & 0x1FF));
     if (!(pml4e & 1)) return 0;
@@ -188,7 +238,7 @@ static BOOLEAN ReadCs2(ULONG64 va, PVOID buf, SIZE_T size) {
     SIZE_T done = 0;
     while (done < size) {
         ULONG64 curVa = va + done;
-        ULONG64 phys = VirtToPhys(g_cr3, curVa);
+        ULONG64 phys  = VirtToPhys(g_cr3, curVa);
         if (!phys) return FALSE;
         SIZE_T chunk = 0x1000 - (curVa & 0xFFF);
         if (chunk > size - done) chunk = size - done;
@@ -199,7 +249,7 @@ static BOOLEAN ReadCs2(ULONG64 va, PVOID buf, SIZE_T size) {
 }
 
 // ============================================================================
-// Поиск процесса
+// Поиск cs2.exe
 // ============================================================================
 typedef struct _SPI {
     ULONG NextEntryOffset; ULONG NumberOfThreads;
@@ -219,17 +269,22 @@ typedef struct _SPI {
 } SPI, *PSPI;
 
 static PEPROCESS FindCs2(HANDLE* outPid) {
+    if (!pZwQuerySystemInformation || !pPsLookupProcessByProcessId) return nullptr;
     ULONG size = 0x20000;
     PVOID buf = nullptr;
     for (int i = 0; i < 4; ++i) {
         buf = ExAllocatePool2(POOL_FLAG_NON_PAGED, size, POOL_TAG);
-        if (!buf) return nullptr;
-        NTSTATUS st = ZwQuerySystemInformation(5, buf, size, &size);
+        if (!buf) { Log("FindCs2: alloc fail"); return nullptr; }
+        ULONG need = size;
+        NTSTATUS st = pZwQuerySystemInformation(5, buf, size, &need);
         if (NT_SUCCESS(st)) break;
         ExFreePoolWithTag(buf, POOL_TAG);
         buf = nullptr;
-        if (st != STATUS_INFO_LENGTH_MISMATCH) return nullptr;
-        size *= 2;
+        if (st != STATUS_INFO_LENGTH_MISMATCH) {
+            Log("FindCs2: ZwQSI st=0x%x", (unsigned)st);
+            return nullptr;
+        }
+        size = (need > size) ? (need + 0x1000) : (size * 2);
     }
     if (!buf) return nullptr;
 
@@ -240,7 +295,7 @@ static PEPROCESS FindCs2(HANDLE* outPid) {
     for (;;) {
         if (spi->ImageName.Buffer && spi->ImageName.Length &&
             RtlEqualUnicodeString(&spi->ImageName, &target, TRUE)) {
-            if (NT_SUCCESS(PsLookupProcessByProcessId(spi->UniqueProcessId, &found))) {
+            if (NT_SUCCESS(pPsLookupProcessByProcessId(spi->UniqueProcessId, &found))) {
                 *outPid = spi->UniqueProcessId;
                 break;
             }
@@ -252,14 +307,6 @@ static PEPROCESS FindCs2(HANDLE* outPid) {
     return found;
 }
 
-static ULONG64 GetPeb(PEPROCESS p) {
-    UNICODE_STRING n;
-    RtlInitUnicodeString(&n, L"PsGetProcessPeb");
-    typedef PVOID(*fnT)(PEPROCESS);
-    fnT fn = (fnT)MmGetSystemRoutineAddress(&n);
-    return fn ? (ULONG64)fn(p) : 0;
-}
-
 static ULONG64 GetCr3(PEPROCESS p) {
     return *(ULONG64*)((PUCHAR)p + 0x28) & PHYS_MASK_4K;
 }
@@ -268,24 +315,16 @@ static ULONG64 GetCr3(PEPROCESS p) {
 // Поиск client.dll
 // ============================================================================
 static ULONG64 FindClientDll() {
-    PEPROCESS p = nullptr;
-    if (!NT_SUCCESS(PsLookupProcessByProcessId(g_pid, &p))) {
-        Log("FMB: PsLookupProcessByProcessId fail");
-        return 0;
-    }
-    ULONG64 peb = GetPeb(p);
-    ObDereferenceObject(p);
-    Log("FMB: peb=%llx", peb);
-    if (!peb) return 0;
+    if (!g_peb) { Log("FMB: no peb"); return 0; }
 
     UCHAR dbg = 0;
-    if (!ReadCs2(peb + 0x02, &dbg, 1)) {
-        Log("FMB: PEB itself unreadable at %llx (CR3 broken)", peb);
+    if (!ReadCs2(g_peb + 0x02, &dbg, 1)) {
+        Log("FMB: PEB unreadable at %llx (CR3 broken)", g_peb);
         return 0;
     }
 
     ULONG64 ldr = 0;
-    if (!ReadCs2(peb + 0x18, &ldr, 8)) { Log("FMB: ldr READ FAIL"); return 0; }
+    if (!ReadCs2(g_peb + 0x18, &ldr, 8)) { Log("FMB: ldr READ FAIL"); return 0; }
     if (!ldr) { Log("FMB: ldr == NULL (not loaded yet)"); return 0; }
     Log("FMB: ldr=%llx", ldr);
 
@@ -337,7 +376,7 @@ static ULONG64 FindClientDll() {
             break;
         }
     }
-    Log("FMB: client.dll NOT found (guard end)");
+    Log("FMB: client.dll NOT found");
     return 0;
 }
 
@@ -345,6 +384,7 @@ static ULONG64 FindClientDll() {
 // Рабочий поток
 // ============================================================================
 static VOID Worker(PVOID) {
+    Log("Worker: started");
     LARGE_INTEGER iv;
     iv.QuadPart = -50000000LL; // 5 сек
 
@@ -357,8 +397,9 @@ static VOID Worker(PVOID) {
             if (p) {
                 g_cr3 = GetCr3(p);
                 g_pid = pid;
+                if (pPsGetProcessPeb) g_peb = (ULONG64)pPsGetProcessPeb(p);
                 ObDereferenceObject(p);
-                Log("cs2 found: pid=%p cr3=%llx peb=%llx", g_pid, g_cr3, GetPeb(nullptr));
+                Log("cs2 found: pid=%p cr3=%llx peb=%llx", g_pid, g_cr3, g_peb);
             } else {
                 Log("cs2.exe not found");
             }
@@ -380,20 +421,40 @@ static VOID Worker(PVOID) {
 
         KeWaitForSingleObject(&g_evt, Executive, KernelMode, FALSE, &iv);
     }
+    Log("Worker: exit");
+    LogClose();
     PsTerminateSystemThread(STATUS_SUCCESS);
 }
 
+// ============================================================================
+// DriverEntry
+// ============================================================================
 extern "C" NTSTATUS DriverEntry(PDRIVER_OBJECT drv, PUNICODE_STRING) {
-    g_cr3 = 0; g_clientBase = 0; g_pid = nullptr; g_stop = 0; g_thread = nullptr;
-    KeInitializeSpinLock(&g_logLock);
+    g_cr3 = 0; g_clientBase = 0; g_peb = 0; g_pid = nullptr;
+    g_stop = 0; g_thread = nullptr; g_logFile = nullptr;
+    g_logOff = 0; g_logReady = false;
+
+    ExInitializeFastMutex(&g_logMutex);
     KeInitializeEvent(&g_evt, NotificationEvent, FALSE);
+
+    if (!ResolveImports()) {
+        DbgPrint("[min] ResolveImports failed\n");
+        // без импортов дальше делать нечего
+        return STATUS_PROCEDURE_NOT_FOUND;
+    }
 
     LogOpen();
     Log("DriverEntry ok");
 
     HANDLE h = nullptr;
-    NTSTATUS st = PsCreateSystemThread(&h, THREAD_ALL_ACCESS, nullptr, nullptr, nullptr, Worker, nullptr);
-    if (!NT_SUCCESS(st)) { Log("PsCreateSystemThread fail 0x%08lX", (unsigned long)st); LogClose(); return st; }
+    NTSTATUS st = PsCreateSystemThread(&h, THREAD_ALL_ACCESS, nullptr, nullptr, nullptr,
+                                       Worker, nullptr);
+    if (!NT_SUCCESS(st)) {
+        Log("PsCreateSystemThread fail 0x%x", (unsigned)st);
+        LogClose();
+        return st;
+    }
+    Log("DriverEntry: thread created");
 
     st = ObReferenceObjectByHandle(h, THREAD_ALL_ACCESS, *PsThreadType, KernelMode,
                                    (PVOID*)&g_thread, nullptr);
@@ -401,9 +462,12 @@ extern "C" NTSTATUS DriverEntry(PDRIVER_OBJECT drv, PUNICODE_STRING) {
     if (!NT_SUCCESS(st)) {
         InterlockedExchange(&g_stop, 1);
         KeSetEvent(&g_evt, 0, FALSE);
-        Log("ObReferenceObjectByHandle fail");
+        Log("ObReferenceObjectByHandle fail 0x%x", (unsigned)st);
         LogClose();
         return st;
     }
+
+    Log("DriverEntry: exit ok");
+    (void)drv;
     return STATUS_SUCCESS;
 }
