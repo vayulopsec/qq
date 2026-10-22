@@ -31,7 +31,7 @@
 // ===========================================================================
 // Контракт Shared Memory (1-в-1 с esp_drv.cpp)
 // ===========================================================================
-constexpr int MAX_ENTITIES = 256;
+constexpr int MAX_ENTITIES = 64;
 constexpr int MAX_BONES    = 24;
 constexpr int MAX_LOGS     = 256;
 constexpr int LOG_LINE_MAX = 128;
