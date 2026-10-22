@@ -216,7 +216,9 @@ static void KVPrintf(char* out, SIZE_T outCap, const char* fmt, va_list ap) {
 }
 
 static void LogRaw(const char* text) {
+#ifdef DBG
     DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL, "[esp_drv] %s\n", text);
+#endif
     if (!g_sharedVa) return;
     ULONG tail = (ULONG)InterlockedIncrement(&g_sharedVa->log.tail) - 1;
     ULONG slot = tail % MAX_LOGS;
@@ -533,7 +535,7 @@ static void Tick() {
     static bool  s_processLogged = false;
     static ULONG s_emptyGraceTicks = 0;
     ULONG tick = ++s_tickCount;
-    bool logNow = ((tick % 500) == 0);
+    bool logNow = ((tick % 2000) == 0);   // ~4 сек вместо 1 сек
 
     // 1) Поиск процесса
     if (!g_cs2Cr3) {
@@ -541,7 +543,7 @@ static void Tick() {
         PEPROCESS p = FindCs2Process(&pid);
         if (!p) {
             ClearShared();
-            if (logNow) Log("cs2.exe not found");
+            if (logNow && (tick % 5000) == 0) Log("cs2.exe not found");   // раз в ~10 сек
             return;
         }
         g_cs2Cr3 = GetProcessCr3(p);
@@ -588,7 +590,7 @@ static void Tick() {
         }
         if (g_clientBase) {
             Log("client.dll found: base=%llx", g_clientBase);
-        } else if (logNow || (tick - s_lastModuleAttempt) < 2) {
+        } else if ((tick % 5000) == 0) {
             Log("module rediscover: clientBase=0 (client.dll not loaded yet)");
         }
     }
@@ -781,7 +783,7 @@ static void Tick() {
         InterlockedIncrement(&g_sharedVa->hdr.seq);
     }
 
-    if (logNow) {
+    if (logNow && (out > 0 || g_clientBase)) {   // не спамить, когда нет игры/сущностей
         Log("tick: ctrl=%u pawn=%u alive=%u bone=%u out=%u maxPawn=%u reads=%u fails=%u",
             ctrlOk, pawnOk, aliveOk, boneOk, out, maxPawn,
             (ULONG)g_statReads, (ULONG)g_statReadFails);
