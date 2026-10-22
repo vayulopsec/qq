@@ -494,7 +494,7 @@ static DWORD WINAPI DiagThread(LPVOID) {
                         shm->hdr.seq, shm->hdr.entityCount, shm->hdr.version, shm->log.tail);
             }
         }
-        Sleep(5000);
+        leep(15000);   // раз в 15 сек вместо 5
     }
     return 0;
 }
