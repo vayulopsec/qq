@@ -403,6 +403,9 @@ static __forceinline BOOLEAN IsCr3Sane(ULONG64 cr3) {
     return TRUE;
 }
 
+// forward declaration: ClearShared определена ниже, но используется в ResetProcessState
+static void ClearShared();
+
 // ---- Централизованный сброс состояния процесса ----
 static void ResetProcessState(const char* reason) {
     Log("process state reset: %s (cr3=%llx pid=%p)", reason, g_cs2Cr3, g_cs2Pid);
@@ -414,8 +417,6 @@ static void ResetProcessState(const char* reason) {
     ResetTlb();
     ClearShared();
 }
-
-static void ClearShared();  // forward declaration for ResetProcessState
 
 // ---- Сверка CR3 с живым процессом (каждый тик) ----
 static BOOLEAN VerifyCr3EachTick() {
