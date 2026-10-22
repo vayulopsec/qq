@@ -58,12 +58,9 @@ constexpr ULONG64 PHYS_MASK_4K          = 0x000FFFFFFFFFF000ULL;
 constexpr ULONG64 PHYS_MASK_2M          = 0x000FFFFFFFE00000ULL;
 constexpr ULONG64 PHYS_MASK_1G          = 0x000FFFFFC0000000ULL;
 
-// Пользовательский VA не может быть >= 0x800000000000 (canonical верх)
-constexpr ULONG64 USER_VA_MAX           = 0x800000000000ULL;
-
 #pragma pack(push, 1)
 struct SHARED_BONE {
-    ULONG xBits, yBits, zBits;
+    ULONG xBits, yBits, zBits; // Храним как сырые 32-битные поля (float на стороне usermode)
 };
 
 struct SHARED_ENTITY {
@@ -95,7 +92,7 @@ struct SHARED_LOG {
 struct SHARED_BLOCK {
     SHARED_HEADER hdr;
     SHARED_LOG    log;
-    SHARED_ENTITY ents[MAX_ENTITIES];
+    SHARED_ENTITY ents[256];
 };
 #pragma pack(pop)
 
@@ -109,7 +106,6 @@ static ULONG*        g_viewVa         = nullptr;
 static ULONG64       g_cs2Cr3         = 0;
 static ULONG64       g_clientBase     = 0;
 static HANDLE        g_cs2Pid         = nullptr;
-static PEPROCESS     g_cs2Proc        = nullptr;  // держим reference для KeStackAttachProcess
 static ULONG64       g_localPawn      = 0;
 static ULONG64       g_entitySystem   = 0;
 static volatile LONG g_stop           = 0;
@@ -119,15 +115,9 @@ static PKTHREAD      g_workerThread   = nullptr;
 static volatile LONG g_logTick        = 0;
 static volatile LONG g_statReads      = 0;
 static volatile LONG g_statReadFails  = 0;
-static volatile LONG g_statAttachReads = 0;
 
-// ---- Состояние для отслеживания смены процесса/PEB ----
-static ULONG64       g_lastPeb          = 0;
-static bool          g_fmbVerboseLogged = false;
-
-// ---- Локальный кэш трансляции адресов (Direct-mapped TLB 256 + PML4) ----
-constexpr ULONG TLB_SIZE     = 256;
-constexpr ULONG PML4_MAX_AGE = 64;   // ~128 мс при 500 Гц
+// ---- Локальный кэш трансляции адресов (TLB 256 + PML4) на один тик ----
+constexpr ULONG TLB_SIZE = 256;
 
 struct TlbEntry {
     ULONG64 vaPage;
@@ -138,7 +128,6 @@ struct TranslationCache {
     TlbEntry entries[TLB_SIZE];
     ULONG64  pml4[512];
     BOOLEAN  pml4Valid;
-    ULONG    pml4Age;
 };
 
 static TranslationCache g_tlb;
@@ -150,14 +139,13 @@ static __forceinline void ResetTlbPages() {
     }
 }
 
-static __forceinline void ResetTlbFull() {
+static __forceinline void ResetTlb() {
     ResetTlbPages();
     g_tlb.pml4Valid = FALSE;
-    g_tlb.pml4Age   = 0;
 }
 
 // ---------------------------------------------------------------------------
-// Мини-форматтер для kernel-mode
+// Мини-форматтер для kernel-mode: без UCRT, без FP
 // ---------------------------------------------------------------------------
 static char* KAppendChar(char* p, char* end, char c) {
     if (p < end) *p++ = c;
@@ -223,9 +211,7 @@ static void KVPrintf(char* out, SIZE_T outCap, const char* fmt, va_list ap) {
 }
 
 static void LogRaw(const char* text) {
-#ifdef DBG
     DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL, "[esp_drv] %s\n", text);
-#endif
     if (!g_sharedVa) return;
     ULONG tail = (ULONG)InterlockedIncrement(&g_sharedVa->log.tail) - 1;
     ULONG slot = tail % MAX_LOGS;
@@ -274,7 +260,6 @@ static __forceinline ULONG64 VirtualToPhysical(ULONG64 cr3, ULONG64 va) {
     if (!g_tlb.pml4Valid) {
         if (ReadPhysicalCached(cr3 & PHYS_MASK_4K, g_tlb.pml4, sizeof(g_tlb.pml4))) {
             g_tlb.pml4Valid = TRUE;
-            g_tlb.pml4Age   = 0;
         }
     }
 
@@ -311,12 +296,8 @@ static __forceinline ULONG64 VirtualToPhysical(ULONG64 cr3, ULONG64 va) {
     return physPage + (va & 0xFFFULL);
 }
 
-// Ручной walk через CR3
-static BOOLEAN ReadViaPhysicalWalk(ULONG64 va, PVOID buf, SIZE_T size) {
+static BOOLEAN ReadCs2Memory(ULONG64 va, PVOID buf, SIZE_T size) {
     if (!g_cs2Cr3 || !va || !buf || !size) return FALSE;
-    if (va >= USER_VA_MAX) return FALSE;
-    if (size > USER_VA_MAX || va + size < va || va + size > USER_VA_MAX) return FALSE;
-
     PUCHAR out = (PUCHAR)buf;
     SIZE_T done = 0;
 
@@ -324,14 +305,15 @@ static BOOLEAN ReadViaPhysicalWalk(ULONG64 va, PVOID buf, SIZE_T size) {
         ULONG64 curVa = va + done;
         ULONG64 startPhys = VirtualToPhysical(g_cs2Cr3, curVa);
         if (!startPhys) {
-            ResetTlbPages();        // только страницы — PML4 не трогаем
+            ResetTlbPages();                    // очищаем все страницы
+            g_tlb.pml4Valid = FALSE;            // форсим перечитывание PML4
+            InterlockedIncrement(&g_statReadFails);
             return FALSE;
         }
 
         SIZE_T chunk = 0x1000 - (curVa & 0xFFF);
         if (chunk > size - done) chunk = size - done;
 
-        // Склеиваем смежные страницы, если они физически непрерывны
         while (done + chunk < size) {
             ULONG64 nextVa = curVa + chunk;
             ULONG64 nextPhys = VirtualToPhysical(g_cs2Cr3, nextVa);
@@ -344,57 +326,20 @@ static BOOLEAN ReadViaPhysicalWalk(ULONG64 va, PVOID buf, SIZE_T size) {
 
         if (!ReadPhysicalCached(startPhys, out + done, chunk)) {
             ResetTlbPages();
+            g_tlb.pml4Valid = FALSE;
+            InterlockedIncrement(&g_statReadFails);
             return FALSE;
         }
+        InterlockedIncrement(&g_statReads);
         done += chunk;
     }
     return TRUE;
 }
 
-// Fallback через KeStackAttachProcess + MmCopyMemory(VIRTUAL).
-// Работает при VBS/HVCI и когда ручной walk CR3 сломан.
-static BOOLEAN ReadViaAttach(ULONG64 va, PVOID buf, SIZE_T size) {
-    if (!g_cs2Proc || !va || !buf || !size) return FALSE;
-    if (va >= USER_VA_MAX) return FALSE;
-
-    KAPC_STATE apc;
-    KeStackAttachProcess(g_cs2Proc, &apc);
-
-    BOOLEAN ok = FALSE;
-    SIZE_T copied = 0;
-    MM_COPY_ADDRESS src;
-    src.VirtualAddress = (PVOID)va;
-    NTSTATUS st = MmCopyMemory(buf, src, size, MM_COPY_MEMORY_VIRTUAL, &copied);
-    ok = NT_SUCCESS(st) && copied == size;
-
-    KeUnstackDetachProcess(&apc);
-    return ok;
-}
-
-// Основная функция чтения: сначала ручной walk, при провале — attach+VIRTUAL.
-static BOOLEAN ReadCs2Memory(ULONG64 va, PVOID buf, SIZE_T size) {
-    if (!va || !buf || !size) return FALSE;
-    if (va >= USER_VA_MAX) return FALSE;
-    if (size > USER_VA_MAX || va + size < va || va + size > USER_VA_MAX) return FALSE;
-
-    if (g_cs2Cr3 && ReadViaPhysicalWalk(va, buf, size)) {
-        InterlockedIncrement(&g_statReads);
-        return TRUE;
-    }
-
-    if (ReadViaAttach(va, buf, size)) {
-        InterlockedIncrement(&g_statAttachReads);
-        return TRUE;
-    }
-
-    InterlockedIncrement(&g_statReadFails);
-    return FALSE;
-}
-
 static __forceinline BOOLEAN RdQ(ULONG64 va, PULONG64 out) { return ReadCs2Memory(va, out, sizeof(ULONG64)); }
 static __forceinline BOOLEAN RdD(ULONG64 va, PULONG   out) { return ReadCs2Memory(va, out, sizeof(ULONG)); }
 
-// ---- Поиск процесса ----
+// ---- Поиск процесса и базы client.dll ----
 typedef struct _SYSTEM_PROCESS_INFO {
     ULONG NextEntryOffset; ULONG NumberOfThreads; LARGE_INTEGER WorkingSetPrivateSize; ULONG HardFaultCount;
     ULONG NumberOfThreadsHighWatermark; ULONGLONG CycleTime; LARGE_INTEGER CreateTime; LARGE_INTEGER UserTime;
@@ -449,70 +394,52 @@ static PEPROCESS FindCs2Process(HANDLE* outPid = nullptr) {
 
 static __forceinline ULONG64 GetProcessCr3(PEPROCESS p) {
     ULONG64 cr3 = *(ULONG64*)((PUCHAR)p + 0x28);
-    return cr3 & PHYS_MASK_4K;
+    return cr3 & PHYS_MASK_4K;   // срезаем PCID/флаги
 }
 
-static __forceinline ULONG64 GetProcessPeb(PEPROCESS p) {
+typedef struct _LDR_ENTRY_OFF {
+    LIST_ENTRY InLoadOrderLinks; PVOID ExceptionTable; ULONG ExceptionTableSize; PVOID GpValue;
+    PVOID NonPagedDebugInfo; PVOID DllBase; PVOID EntryPoint; ULONG SizeOfImage;
+    UNICODE_STRING FullDllName; UNICODE_STRING BaseDllName;
+} LDR_ENTRY_OFF;
+
+static ULONG64 FindModuleBase(PEPROCESS proc, PCWSTR moduleName, bool verbose) {
     UNICODE_STRING fnName;
     RtlInitUnicodeString(&fnName, L"PsGetProcessPeb");
     typedef PVOID(*fnPeb)(PEPROCESS);
     fnPeb fn = (fnPeb)MmGetSystemRoutineAddress(&fnName);
-    if (!fn) return 0;
-    return (ULONG64)fn(p);
-}
+    if (!fn) { if (verbose) Log("FMB: PsGetProcessPeb not resolved"); return 0; }
 
-// ---- Правильная структура _LDR_DATA_TABLE_ENTRY ----
-typedef struct _LDR_ENTRY_OFF {
-    LIST_ENTRY     InLoadOrderLinks;              // +0x000
-    LIST_ENTRY     InMemoryOrderLinks;            // +0x010
-    LIST_ENTRY     InInitializationOrderLinks;    // +0x020
-    PVOID          DllBase;                       // +0x030
-    PVOID          EntryPoint;                    // +0x038
-    ULONG          SizeOfImage;                   // +0x040
-    UNICODE_STRING FullDllName;                   // +0x048
-    UNICODE_STRING BaseDllName;                   // +0x058
-} LDR_ENTRY_OFF;
+    ULONG64 peb = (ULONG64)fn(proc);
+    if (verbose) Log("FMB: peb=%llx", peb);
+    if (!peb) return 0;
 
-struct LdrListDesc {
-    ULONG headOff;       // offset в _PEB_LDR_DATA
-    ULONG linkOff;       // offset links в _LDR_DATA_TABLE_ENTRY
-    const char* name;
-};
-
-// Все три списка с корректными смещениями
-static const LdrListDesc LDR_LISTS[3] = {
-    { 0x10, 0x00, "InLoadOrder" },
-    { 0x20, 0x10, "InMemoryOrder" },
-    { 0x30, 0x20, "InInitOrder" },
-};
-
-static ULONG64 TryLdrList(ULONG64 ldr, const LdrListDesc& list, PCWSTR moduleName,
-                          bool verbose) {
     UNICODE_STRING want;
     RtlInitUnicodeString(&want, moduleName);
 
-    ULONG64 head = ldr + list.headOff;
-    ULONG64 cur = 0;
-    if (!RdQ(head, &cur) || !cur) return 0;
+    ULONG64 ldr = 0;
+    if (!RdQ(peb + 0x18, &ldr) || !ldr) {
+        if (verbose) Log("FMB: ldr read fail/null (client.dll not loaded yet?)");
+        return 0;
+    }
+    if (verbose) Log("FMB: ldr=%llx", ldr);
 
-    // Валидация: user VA, выровнено на 8
-    if (cur >= USER_VA_MAX || (cur & 7)) return 0;
+    ULONG64 head = ldr + 0x10;
+    ULONG64 cur = 0;
+    if (!RdQ(head, &cur)) {
+        if (verbose) Log("FMB: head read fail");
+        return 0;
+    }
+    if (verbose) Log("FMB: head=%llx firstCur=%llx", head, cur);
 
     int guard = 0;
-    // Реально в CS2 модулей ~10-15. Ставим 16 — античит не сможет зациклить нас надолго.
-    for (; guard < 16 && cur && cur != head; ++guard) {
-        // cur указывает на &entry->{...}Links
-        ULONG64 entryVa = cur - list.linkOff;
-
+    for (; guard < 2048 && cur && cur != head; ++guard) {
         LDR_ENTRY_OFF e = {};
-        if (!ReadCs2Memory(entryVa, &e, sizeof(e))) break;
-
-        ULONG64 base = (ULONG64)e.DllBase;
-        USHORT mz = 0;
-        bool mzOk = base && base < USER_VA_MAX
-                    && ReadCs2Memory(base, &mz, sizeof(mz)) && mz == 0x5A4D;
-
-        if (mzOk && e.BaseDllName.Buffer && e.BaseDllName.Length) {
+        if (!ReadCs2Memory(cur, &e, sizeof(e))) {
+            if (verbose) Log("FMB: entry read fail cur=%llx guard=%d", cur, guard);
+            return 0;
+        }
+        if (e.BaseDllName.Buffer && e.BaseDllName.Length) {
             WCHAR n[128] = {};
             USHORT len = e.BaseDllName.Length;
             if (len > sizeof(n) - sizeof(WCHAR)) len = sizeof(n) - sizeof(WCHAR);
@@ -521,265 +448,26 @@ static ULONG64 TryLdrList(ULONG64 ldr, const LdrListDesc& list, PCWSTR moduleNam
                 UNICODE_STRING un;
                 RtlInitUnicodeString(&un, n);
                 if (RtlEqualUnicodeString(&un, &want, TRUE)) {
-                    if (verbose) Log("FMB[%s]: found at %llx (guard=%d)", list.name, base, guard);
-                    return base;
-                }
-            }
-        }
-
-        // Следующий элемент — Flink по тому же offset внутри entry
-        ULONG64 nextLink = 0;
-        if (!RdQ(entryVa + list.linkOff, &nextLink)) break;
-        cur = nextLink;
-        if (!cur || cur >= USER_VA_MAX || (cur & 7)) break;
-    }
-    if (verbose) Log("FMB[%s]: not found guard=%d", list.name, guard);
-    return 0;
-}
-
-static ULONG64 FindModuleViaLdr(PEPROCESS proc, PCWSTR moduleName, bool verbose) {
-    ULONG64 peb = GetProcessPeb(proc);
-    if (verbose) Log("FMB: peb=%llx", peb);
-    if (!peb) return 0;
-
-    // Sanity: PEB->BeingDebugged (+0x02) должен читаться
-    UCHAR beingDebugged = 0;
-    if (!ReadCs2Memory(peb + 0x02, &beingDebugged, 1)) {
-        if (verbose) Log("FMB: PEB itself unreadable at %llx", peb);
-        return 0;
-    }
-
-    ULONG64 ldr = 0;
-    if (!RdQ(peb + 0x18, &ldr)) {
-        if (verbose) Log("FMB: ldr READ FAIL peb=%llx", peb);
-        return 0;
-    }
-    if (!ldr) {
-        if (verbose) Log("FMB: ldr == NULL (not initialized) peb=%llx", peb);
-        return 0;
-    }
-    if (verbose) Log("FMB: ldr=%llx", ldr);
-
-    // Пробуем все три списка по очереди
-    for (const auto& list : LDR_LISTS) {
-        ULONG64 base = TryLdrList(ldr, list, moduleName, verbose);
-        if (base) return base;
-    }
-    return 0;
-}
-
-// ---- VAD-обход (primary метод) ----
-// Динамически находим offset VadRoot через RtlGetVersion + таблицу,
-// т.к. в разных сборках он разный. Но т.к. таблицу обновлять сложно,
-// используем универсальный способ: перебираем известные offset'ы и проверяем,
-// что первый узел дерева выглядит как валидный _MMVAD.
-//
-// Известные значения VadRoot для _EPROCESS:
-//   Win10 19041-19045: 0x628
-//   Win11 22000-22621: 0x7D8
-//   Win11 22631+:      0x7D8 (проверить!)
-// Пользовательский дамп (не x64 Win10/11) даёт 0x558 — не используем как primary.
-//
-// Более надёжный способ: RtlGetVersion → build number → таблица.
-
-typedef struct _RTL_BALANCED_NODE_LOCAL {
-    struct _RTL_BALANCED_NODE_LOCAL* Children[2];
-    union {
-        struct _RTL_BALANCED_NODE_LOCAL* Left;
-        struct _RTL_BALANCED_NODE_LOCAL* Right;
-    };
-    ULONG_PTR ParentValue;
-} RTL_BALANCED_NODE_LOCAL;
-
-typedef struct _RTL_AVL_TREE_LOCAL {
-    RTL_BALANCED_NODE_LOCAL* Root;
-} RTL_AVL_TREE_LOCAL;
-
-static ULONG GetVadRootOffset() {
-    RTL_OSVERSIONINFOW vi = {};
-    vi.dwOSVersionInfoSize = sizeof(vi);
-    // RtlGetVersion всегда возвращает реальную версию (в отличие от GetVersionEx)
-    typedef NTSTATUS(NTAPI* fnRtlGetVersion)(PRTL_OSVERSIONINFOW);
-    UNICODE_STRING fnName;
-    RtlInitUnicodeString(&fnName, L"RtlGetVersion");
-    fnRtlGetVersion fn = (fnRtlGetVersion)MmGetSystemRoutineAddress(&fnName);
-    if (!fn) return 0x7D8; // default Win11
-    if (!NT_SUCCESS(fn(&vi))) return 0x7D8;
-
-    ULONG build = vi.dwBuildNumber;
-
-    // Win10 19041..19045
-    if (build >= 19041 && build <= 19045) return 0x628;
-    // Win11 22000..22621
-    if (build >= 22000 && build < 22631) return 0x7D8;
-    // Win11 22631+
-    if (build >= 22631) return 0x7D8;
-    // fallback
-    return 0x7D8;
-}
-
-// Обход AVL-дерева VAD и поиск модуля по имени файла.
-// Возвращает базовый VA региона или 0.
-static ULONG64 FindModuleViaVad(PEPROCESS proc, PCWSTR moduleName, bool verbose) {
-    ULONG vadRootOff = GetVadRootOffset();
-    if (verbose) Log("VAD: rootOff=0x%x", vadRootOff);
-
-    RTL_AVL_TREE_LOCAL tree = {};
-    // Читаем VadRoot через attach — надёжнее, т.к. EPROCESS в system space
-    // (но EPROCESS всегда доступен напрямую по kernel VA, attach не нужен)
-    RtlCopyMemory(&tree, (PUCHAR)proc + vadRootOff, sizeof(tree));
-    if (!tree.Root) {
-        if (verbose) Log("VAD: root is NULL");
-        return 0;
-    }
-
-    // Итеративный обход с ограничением
-    constexpr int MAX_VADS = 4096;
-    RTL_BALANCED_NODE_LOCAL* stack[MAX_VADS];
-    int sp = 0;
-    stack[sp++] = tree.Root;
-
-    // Оффсеты _MMVAD (Win10 19041+ / Win11):
-    //   _MMVAD.Core (т.е. _MMVAD_SHORT) на +0x00
-    //   _MMVAD.Subsection на +0x48 (Win10) / +0x50 (некоторые сборки)
-    //   _SUBSECTION.ControlArea на +0x00
-    //   _CONTROL_AREA.FilePointer на +0x20
-    //   _FILE_OBJECT.FileName на +0x30
-    //
-    // Если Subsection = 0 — это не image VAD, пропускаем.
-    // Проверяем три варианта offset Subsection: 0x48, 0x50, 0x40.
-    constexpr ULONG SUBSECTION_OFF_CANDIDATES[] = { 0x48, 0x50, 0x40 };
-
-    while (sp > 0) {
-        RTL_BALANCED_NODE_LOCAL* node = stack[--sp];
-        if (!node) continue;
-
-        // Проверяем, что узел читается
-        RTL_BALANCED_NODE_LOCAL local = {};
-        RtlCopyMemory(&local, node, sizeof(local));
-
-        // _MMVAD_SHORT начинается с VadNode (RTL_BALANCED_NODE).
-        // StartingVpn на +0x18, EndingVpn на +0x20.
-        // Но т.к. VadNode — это вложенная структура, начало _MMVAD_SHORT = node.
-        ULONG64 mmvad = (ULONG64)node;
-        ULONG64 startingVpn = 0, endingVpn = 0;
-        RtlCopyMemory(&startingVpn, (PVOID)(mmvad + 0x18), sizeof(startingVpn));
-        RtlCopyMemory(&endingVpn,   (PVOID)(mmvad + 0x20), sizeof(endingVpn));
-
-        if (endingVpn < startingVpn || startingVpn == 0) {
-            // не image VAD или битые данные — идём дальше
-        } else {
-            ULONG64 regionBase = startingVpn << 12;
-            ULONG64 regionSize = (endingVpn - startingVpn + 1) << 12;
-
-            // Проверяем MZ по базе региона
-            USHORT mz = 0;
-            if (regionBase < USER_VA_MAX &&
-                regionSize >= 0x1000 &&
-                ReadCs2Memory(regionBase, &mz, sizeof(mz)) && mz == 0x5A4D) {
-
-                // Пробуем найти имя модуля через Subsection->ControlArea->FilePointer
-                for (ULONG subOff : SUBSECTION_OFF_CANDIDATES) {
-                    ULONG64 subsection = 0;
-                    RtlCopyMemory(&subsection, (PVOID)(mmvad + subOff), sizeof(subsection));
-                    if (!subsection || subsection >= USER_VA_MAX) continue;
-
-                    // _SUBSECTION.ControlArea на +0x00
-                    ULONG64 controlArea = 0;
-                    if (!ReadCs2Memory(subsection, &controlArea, sizeof(controlArea))) continue;
-                    if (!controlArea || controlArea >= USER_VA_MAX) continue;
-
-                    // _CONTROL_AREA.FilePointer на +0x20
-                    ULONG64 fileObj = 0;
-                    if (!ReadCs2Memory(controlArea + 0x20, &fileObj, sizeof(fileObj))) continue;
-                    if (!fileObj || fileObj >= USER_VA_MAX) continue;
-
-                    // _FILE_OBJECT.FileName на +0x30 (UNICODE_STRING)
-                    UNICODE_STRING fileName = {};
-                    if (!ReadCs2Memory(fileObj + 0x30, &fileName, sizeof(fileName))) continue;
-                    if (!fileName.Buffer || !fileName.Length || fileName.Length > 512) continue;
-
-                    WCHAR fullPath[260] = {};
-                    USHORT len = fileName.Length;
-                    if (len > sizeof(fullPath) - sizeof(WCHAR)) len = sizeof(fullPath) - sizeof(WCHAR);
-                    if (!ReadCs2Memory((ULONG64)fileName.Buffer, fullPath, len)) continue;
-
-                    // Сравниваем по суффиксу (имя файла без пути)
-                    // moduleName = "client.dll", fullPath = "\Device\HarddiskVolumeX\...\client.dll"
-                    USHORT chars = len / sizeof(WCHAR);
-                    UNICODE_STRING want;
-                    RtlInitUnicodeString(&want, moduleName);
-                    USHORT wantChars = want.Length / sizeof(WCHAR);
-
-                    if (chars >= wantChars) {
-                        bool match = true;
-                        for (USHORT k = 0; k < wantChars; ++k) {
-                            WCHAR a = fullPath[chars - wantChars + k];
-                            WCHAR b = want.Buffer[k];
-                            // case-insensitive
-                            if (a >= L'A' && a <= L'Z') a = (WCHAR)(a + 32);
-                            if (b >= L'A' && b <= L'Z') b = (WCHAR)(b + 32);
-                            if (a != b) { match = false; break; }
-                        }
-                        if (match) {
-                            if (verbose) Log("VAD: found %ws at %llx", moduleName, regionBase);
-                            return regionBase;
-                        }
+                    // ВАЛИДАЦИЯ: по DllBase реально должен читаться "MZ"
+                    ULONG64 base = (ULONG64)e.DllBase;
+                    USHORT mz = 0;
+                    if (base && ReadCs2Memory(base, &mz, sizeof(mz)) && mz == 0x5A4D) {
+                        if (verbose) Log("FMB: found at %llx (guard=%d) MZ ok", base, guard);
+                        return base;
                     }
+                    if (verbose) Log("FMB: candidate %llx guard=%d MZ fail, skip", base, guard);
+                    // не возвращаем — идём дальше по списку
                 }
             }
         }
-
-        // Обход детей
-        if (local.Children[0] && sp < MAX_VADS) stack[sp++] = local.Children[0];
-        if (local.Children[1] && sp < MAX_VADS) stack[sp++] = local.Children[1];
+        cur = (ULONG64)e.InLoadOrderLinks.Flink;
+        // ВАЛИДАЦИЯ Flink: должен быть в user-space и выровнен на 8
+        if (!cur || cur >= 0x7FFFFFFFFFFFULL || (cur & 7)) {
+            if (verbose) Log("FMB: bad Flink=%llx guard=%d, break", cur, guard);
+            break;
+        }
     }
-
-    if (verbose) Log("VAD: not found");
-    return 0;
-}
-
-// Fallback: PEB->ImageBaseAddress (это base EXE, не DLL).
-// Используется только как последняя надежда — если ничего другого не сработало.
-static ULONG64 FindModuleViaImageBase(PEPROCESS proc, PCWSTR moduleName, bool verbose) {
-    ULONG64 peb = GetProcessPeb(proc);
-    if (!peb) return 0;
-
-    ULONG64 imageBase = 0;
-    if (!RdQ(peb + 0x10, &imageBase) || !imageBase) return 0;
-
-    // Если ищем не exe, этот путь не подходит — возвращаем 0
-    // Но по крайней мере проверим MZ
-    USHORT mz = 0;
-    if (!ReadCs2Memory(imageBase, &mz, sizeof(mz)) || mz != 0x5A4D) return 0;
-
-    // Ищем "client.dll" в строках PE-заголовка (экспорт/импорт) — слишком сложно,
-    // поэтому просто возвращаем 0, если имя не совпадает с cs2.exe
-    UNICODE_STRING want;
-    RtlInitUnicodeString(&want, moduleName);
-    UNICODE_STRING exeName;
-    RtlInitUnicodeString(&exeName, L"cs2.exe");
-    if (RtlEqualUnicodeString(&want, &exeName, TRUE)) {
-        if (verbose) Log("ImageBase: found cs2.exe at %llx", imageBase);
-        return imageBase;
-    }
-    return 0;
-}
-
-// Основная функция поиска модуля: VAD → Ldr → ImageBase
-static ULONG64 FindModuleBase(PEPROCESS proc, PCWSTR moduleName, bool verbose) {
-    // 1) VAD-обход (primary — античит не трогает)
-    ULONG64 base = FindModuleViaVad(proc, moduleName, verbose);
-    if (base) return base;
-
-    // 2) Ldr-обход (все три списка)
-    base = FindModuleViaLdr(proc, moduleName, verbose);
-    if (base) return base;
-
-    // 3) ImageBase (только для exe)
-    base = FindModuleViaImageBase(proc, moduleName, verbose);
-    if (base) return base;
-
+    if (verbose) Log("FMB: not found guard=%d cur=%llx", guard, cur);
     return 0;
 }
 
@@ -792,23 +480,12 @@ static void ClearShared() {
     InterlockedIncrement(&g_sharedVa->hdr.seq);
 }
 
-constexpr ULONG CACHED_CHUNKS = 3;
-static UCHAR*         g_chunkCache   = nullptr;
-static UCHAR*         g_bonesScratch = nullptr;
-static UCHAR*         g_pawnScratch  = nullptr;
-static SHARED_ENTITY* g_localEnts    = nullptr;
-static SHARED_ENTITY* g_prevEnts     = nullptr;
-
-struct SlotPtrCache {
-    ULONG64 ctrl;
-    ULONG   hPawn;
-    ULONG64 pawn;
-    ULONG64 scene;
-    ULONG64 bMat;
-    ULONG   lastUpdateTick;
-};
-
-static SlotPtrCache g_slotCache[MAX_ENTITIES] = {};
+constexpr ULONG CACHED_CHUNKS = 4; // индексы 0..2047
+static UCHAR*         g_chunkCache   = nullptr; // CACHED_CHUNKS * 512 * 112 = 224 КБ
+static UCHAR*         g_bonesScratch = nullptr; // MAX_BONES * 0x20 = 768 байт
+static UCHAR*         g_pawnScratch  = nullptr; // PAWN_BATCH_SIZE = 0xB8 байт
+static SHARED_ENTITY* g_localEnts    = nullptr; // Сборка текущего тика (вне Seqlock)
+static SHARED_ENTITY* g_prevEnts     = nullptr; // Кэш костей по слоту игрока (1..64) на случай промаха чтения
 
 static __forceinline ULONG64 FastEntityByIndex(const ULONG64* chunkPtrs,
                                                 const BOOLEAN* chunkValid,
@@ -826,49 +503,14 @@ static __forceinline ULONG64 FastEntityByIndex(const ULONG64* chunkPtrs,
 }
 
 static void Tick() {
-    if (g_tlb.pml4Valid) {
-        if (++g_tlb.pml4Age >= PML4_MAX_AGE) {
-            g_tlb.pml4Valid = FALSE;
-            g_tlb.pml4Age   = 0;
-        }
-    }
-    ResetTlbPages();
+    ResetTlb();
 
     static ULONG s_tickCount = 0;
     static ULONG s_lastModuleAttempt = 0;
     static bool  s_processLogged = false;
     static ULONG s_emptyGraceTicks = 0;
-    static ULONG s_mzFailCount = 0;
     ULONG tick = ++s_tickCount;
-    bool logNow = ((tick % 2000) == 0);
-
-    // ---- Проверка живости процесса и смены PEB/CR3 ----
-    if (g_cs2Pid) {
-        PEPROCESS p = nullptr;
-        if (!NT_SUCCESS(PsLookupProcessByProcessId(g_cs2Pid, &p))) {
-            Log("cs2.exe exited, full reset (pid=%p)", g_cs2Pid);
-            if (g_cs2Proc) { ObDereferenceObject(g_cs2Proc); g_cs2Proc = nullptr; }
-            g_cs2Cr3 = 0; g_clientBase = 0; g_cs2Pid = nullptr;
-            g_lastPeb = 0; g_fmbVerboseLogged = false;
-            s_processLogged = false;
-            ResetTlbFull();
-            ClearShared();
-            return;
-        }
-
-        if ((tick & 0xF) == 0) {
-            ULONG64 curPeb = GetProcessPeb(p);
-            if (curPeb && g_lastPeb && curPeb != g_lastPeb) {
-                Log("PEB changed %llx -> %llx, reset", g_lastPeb, curPeb);
-                g_clientBase = 0;
-                g_fmbVerboseLogged = false;
-                ResetTlbFull();
-                g_cs2Cr3 = GetProcessCr3(p);
-            }
-            if (curPeb) g_lastPeb = curPeb;
-        }
-        ObDereferenceObject(p);
-    }
+    bool logNow = ((tick % 500) == 0);
 
     // 1) Поиск процесса
     if (!g_cs2Cr3) {
@@ -876,21 +518,16 @@ static void Tick() {
         PEPROCESS p = FindCs2Process(&pid);
         if (!p) {
             ClearShared();
-            if (logNow && (tick % 5000) == 0) Log("cs2.exe not found");
+            if (logNow) Log("cs2.exe not found");
             return;
         }
         g_cs2Cr3 = GetProcessCr3(p);
         g_cs2Pid = pid;
-        g_lastPeb = GetProcessPeb(p);
-
-        // Сохраняем reference на EPROCESS для KeStackAttachProcess
-        if (g_cs2Proc) ObDereferenceObject(g_cs2Proc);
-        g_cs2Proc = p;   // НЕ освобождаем — используем для attach
-        ResetTlbFull();
+        ObDereferenceObject(p);
+        ResetTlb();
 
         if (!s_processLogged) {
-            Log("process found: pid=%p cr3=%llx peb=%llx",
-                g_cs2Pid, g_cs2Cr3, g_lastPeb);
+            Log("process found: pid=%p cr3=%llx", g_cs2Pid, g_cs2Cr3);
             s_processLogged = true;
         }
         if (!g_cs2Cr3) {
@@ -899,19 +536,18 @@ static void Tick() {
         }
     }
 
-    // 2) Поиск/перепроверка client.dll
+    // 2) Поиск/перепроверка модуля client.dll
     bool needModuleCheck = (!g_clientBase) || ((tick - s_lastModuleAttempt) >= 64);
 
+    static ULONG s_mzFailCount = 0;
     if (g_clientBase && (tick & 0x3F) == 0) {
         USHORT mz = 0;
         if (!ReadCs2Memory(g_clientBase, &mz, sizeof(mz)) || mz != 0x5A4D) {
             if (++s_mzFailCount >= 3) {
                 s_mzFailCount = 0;
                 Log("client.dll MZ check failed 3x, resetting clientBase");
-                g_clientBase = 0;
-                g_fmbVerboseLogged = false;
-                // ВАЖНО: только страницы, НЕ PML4 — иначе теряем весь кэш
-                ResetTlbPages();
+                g_clientBase = 0;          // НЕ сбрасываем g_cs2Cr3
+                ResetTlb();
                 needModuleCheck = true;
             }
         } else {
@@ -922,25 +558,15 @@ static void Tick() {
     if (needModuleCheck && !g_clientBase) {
         s_lastModuleAttempt = tick;
         PEPROCESS p = nullptr;
-        if (g_cs2Proc) {
-            // Используем сохранённый EPROCESS
-            bool verbose = !g_fmbVerboseLogged;
-            g_clientBase = FindModuleBase(g_cs2Proc, L"client.dll", verbose);
-        } else if (NT_SUCCESS(PsLookupProcessByProcessId(g_cs2Pid, &p))) {
-            bool verbose = !g_fmbVerboseLogged;
+        if (NT_SUCCESS(PsLookupProcessByProcessId(g_cs2Pid, &p))) {
+            bool verbose = (g_clientBase == 0);
             g_clientBase = FindModuleBase(p, L"client.dll", verbose);
             ObDereferenceObject(p);
         }
         if (g_clientBase) {
-            g_fmbVerboseLogged = true;
             Log("client.dll found: base=%llx", g_clientBase);
-        } else {
-            g_fmbVerboseLogged = true;
-            g_tlb.pml4Valid = FALSE;
-            g_tlb.pml4Age   = 0;
-            if ((tick % 5000) == 0) {
-                Log("module rediscover: clientBase=0 (client.dll not loaded yet)");
-            }
+        } else if (logNow || (tick - s_lastModuleAttempt) < 2) {
+            Log("module rediscover: clientBase=0 (client.dll not loaded yet)");
         }
     }
 
@@ -949,7 +575,7 @@ static void Tick() {
         return;
     }
 
-    // 3) Чтение данных игры (вне Seqlock)
+    // 3) Чтение данных игры (полностью ВНЕ Seqlock)
     ULONG64 lp = 0, es = 0;
     RdQ(g_clientBase + OFF_dwLocalPlayerPawn, &lp);
     RdQ(g_clientBase + OFF_dwEntityList, &es);
@@ -982,55 +608,23 @@ static void Tick() {
         }
     }
 
-    ULONG out = 0, ctrlOk = 0, pawnOk = 0, aliveOk = 0, boneOk = 0, maxPawn = 0;
+    ULONG out = 0, ctrlOk = 0, pawnOk = 0, aliveOk = 0, boneOk = 0;
 
     for (ULONG i = 1; i <= 64 && out < MAX_ENTITIES; ++i) {
         ULONG slotIdx = i - 1;
-        SlotPtrCache& sc = g_slotCache[slotIdx];
-
         ULONG64 ctrl = FastEntityByIndex(chunkPtrs, chunkValid, i);
-        if (!ctrl) {
-            sc.ctrl = 0;
-            if (g_prevEnts) g_prevEnts[slotIdx].valid = 0;
-            continue;
-        }
+        if (!ctrl) continue;
         ++ctrlOk;
 
-        bool refreshSlot = (ctrl != sc.ctrl) || !sc.pawn || ((tick - sc.lastUpdateTick) >= 20);
-        if (refreshSlot) {
-            ULONG hPawn = 0;
-            if (!RdD(ctrl + OFF_m_hPlayerPawn, &hPawn) || !hPawn || hPawn == 0xFFFFFFFF) {
-                sc.ctrl = ctrl;
-                sc.pawn = 0;
-                if (g_prevEnts) g_prevEnts[slotIdx].valid = 0;
-                continue;
-            }
-            sc.ctrl           = ctrl;
-            sc.hPawn          = hPawn;
-            sc.lastUpdateTick = tick - (i & 7);
-        }
+        ULONG hPawn = 0;
+        if (!RdD(ctrl + OFF_m_hPlayerPawn, &hPawn) || !hPawn || hPawn == 0xFFFFFFFF) continue;
 
-        ULONG pawnIdx = sc.hPawn & 0x7FFF;
-        if (pawnIdx > maxPawn) maxPawn = pawnIdx;
-
-        ULONG64 pawn = FastEntityByIndex(chunkPtrs, chunkValid, pawnIdx);
-        if (!pawn || pawn == lp) {
-            sc.pawn = 0;
-            if (g_prevEnts) g_prevEnts[slotIdx].valid = 0;
-            continue;
-        }
-        if (pawn != sc.pawn) {
-            sc.pawn  = pawn;
-            sc.scene = 0;
-            sc.bMat  = 0;
-        }
+        ULONG64 pawn = FastEntityByIndex(chunkPtrs, chunkValid, hPawn & 0x7FFF);
+        if (!pawn || pawn == lp) continue;
         ++pawnOk;
 
         if (!g_pawnScratch) continue;
-        if (!ReadCs2Memory(pawn + PAWN_BATCH_BASE, g_pawnScratch, PAWN_BATCH_SIZE)) {
-            sc.pawn = 0;
-            continue;
-        }
+        if (!ReadCs2Memory(pawn + PAWN_BATCH_BASE, g_pawnScratch, PAWN_BATCH_SIZE)) continue;
 
         ULONG64 scene = *(ULONG64*)(g_pawnScratch + (OFF_m_pGameSceneNode - PAWN_BATCH_BASE));
         int     hp    = *(int*)    (g_pawnScratch + (OFF_m_iHealth        - PAWN_BATCH_BASE));
@@ -1038,34 +632,21 @@ static void Tick() {
         UCHAR   team  = *(UCHAR*)  (g_pawnScratch + (OFF_m_iTeamNum       - PAWN_BATCH_BASE));
 
         if (hp <= 0 || hp > 200 || ls != 0 || team == myTeam || !scene) {
-            sc.bMat = 0;
             if (g_prevEnts) g_prevEnts[slotIdx].valid = 0;
             continue;
         }
 
         ++aliveOk;
 
-        if (scene != sc.scene || !sc.bMat || refreshSlot) {
-            ULONG64 newBMat = 0;
-            if (RdQ(scene + OFF_m_modelState + 0x80, &newBMat) && newBMat) {
-                sc.scene = scene;
-                sc.bMat  = newBMat;
-            } else {
-                sc.bMat = 0;
-            }
-        }
-
-        ULONG64 bMat = sc.bMat;
+        ULONG64 bMat = 0;
         bool bonesReadSuccess = false;
-        if (bMat && g_bonesScratch) {
+        if (RdQ(scene + OFF_m_modelState + 0x80, &bMat) && bMat && g_bonesScratch) {
             if (ReadCs2Memory(bMat, g_bonesScratch, MAX_BONES * 0x20)) {
+                // Проверяем, что кость головы (индекс 6 или 7) не нулевая
                 const ULONG* headBone = (const ULONG*)(g_bonesScratch + (SIZE_T)6 * 0x20);
                 if (headBone[0] != 0 || headBone[1] != 0 || headBone[2] != 0) {
                     bonesReadSuccess = true;
                 }
-            }
-            if (!bonesReadSuccess) {
-                sc.bMat = 0;
             }
         }
 
@@ -1087,6 +668,7 @@ static void Tick() {
             }
             ++out;
         } else if (g_prevEnts && g_prevEnts[slotIdx].valid && g_localEnts) {
+            // Если на этом тике чтение костей сорвалось, используем кэш прошлого тика для этого слота
             SHARED_ENTITY& dst = g_localEnts[out];
             RtlCopyMemory(&dst, &g_prevEnts[slotIdx], sizeof(SHARED_ENTITY));
             dst.hp   = hp;
@@ -1110,7 +692,7 @@ static void Tick() {
         s_emptyGraceTicks = 0;
     }
 
-    // 4) Публикация под Seqlock
+    // 4) Мгновенное копирование готового буфера под Seqlock
     if (g_sharedVa && g_localEnts) {
         InterlockedIncrement(&g_sharedVa->hdr.seq);
         KeMemoryBarrier();
@@ -1128,18 +710,18 @@ static void Tick() {
         InterlockedIncrement(&g_sharedVa->hdr.seq);
     }
 
-    if (logNow && (out > 0 || g_clientBase)) {
-        Log("tick: ctrl=%u pawn=%u alive=%u bone=%u out=%u maxPawn=%u reads=%u attach=%u fails=%u",
-            ctrlOk, pawnOk, aliveOk, boneOk, out, maxPawn,
-            (ULONG)g_statReads, (ULONG)g_statAttachReads, (ULONG)g_statReadFails);
+    if (logNow) {
+        Log("tick: ctrl=%u pawn=%u alive=%u bone=%u out=%u reads=%u fails=%u",
+            ctrlOk, pawnOk, aliveOk, boneOk, out,
+            (ULONG)g_statReads, (ULONG)g_statReadFails);
     }
 }
 
 static VOID WorkerThread(PVOID) {
-    KeSetPriorityThread(KeGetCurrentThread(), 8);
+    KeSetPriorityThread(KeGetCurrentThread(), 8);   // 8 = NORMAL_PRIORITY в терминах ядра
 
     LARGE_INTEGER interval;
-    interval.QuadPart = -20000LL;  // 2 мс
+    interval.QuadPart = -20000LL;  // 2 мс = 500 Гц ровно
 
     for (;;) {
         if (InterlockedCompareExchange(&g_stop, 0, 0)) break;
@@ -1222,7 +804,7 @@ static NTSTATUS CreateShared() {
 
         g_sharedVa = (SHARED_BLOCK*)base;
         g_sharedVa->hdr.version = 1;
-        g_sharedVa->hdr.maxEntities = MAX_ENTITIES;
+        g_sharedVa->hdr.maxEntities = MAX_ENTITIES;   // 64
     }
 
     if (!g_viewVa) {
@@ -1249,7 +831,6 @@ static void DestroyShared() {
     if (g_pawnScratch)    { ExFreePoolWithTag(g_pawnScratch, POOL_TAG); g_pawnScratch = nullptr; }
     if (g_localEnts)      { ExFreePoolWithTag(g_localEnts, POOL_TAG); g_localEnts = nullptr; }
     if (g_prevEnts)       { ExFreePoolWithTag(g_prevEnts, POOL_TAG); g_prevEnts = nullptr; }
-    if (g_cs2Proc)        { ObDereferenceObject(g_cs2Proc); g_cs2Proc = nullptr; }
 }
 
 static VOID DriverUnloadFn(PDRIVER_OBJECT) {
@@ -1261,6 +842,10 @@ static VOID DriverUnloadFn(PDRIVER_OBJECT) {
         g_workerThread = nullptr;
     }
     DestroyShared();
+
+    // ВАЖНО: восстанавливаем стандартную частоту системного таймера.
+    // Если этого не сделать, после выгрузки драйвера таймер останется на 0.5 мс,
+    // что повышает энергопотребление всей системы (ноутбуки/батарея).
     ExSetTimerResolution(0, FALSE);
 }
 
@@ -1268,20 +853,15 @@ extern "C" NTSTATUS DriverEntry(PDRIVER_OBJECT drv, PUNICODE_STRING) {
     g_hSharedSection = nullptr; g_sharedSecObj = nullptr; g_sharedVa = nullptr;
     g_hViewSection   = nullptr; g_viewSecObj   = nullptr; g_viewVa   = nullptr;
     g_cs2Cr3 = 0; g_clientBase = 0; g_cs2Pid = nullptr;
-    g_cs2Proc = nullptr;
     g_localPawn = 0; g_entitySystem = 0;
     g_stop = 0; g_workerThread = nullptr;
     g_logTick = 0; g_statReads = 0; g_statReadFails = 0;
-    g_statAttachReads = 0;
-    g_lastPeb = 0;
-    g_fmbVerboseLogged = false;
     g_chunkCache = nullptr;
     g_bonesScratch = nullptr;
     g_pawnScratch = nullptr;
     g_localEnts = nullptr;
     g_prevEnts = nullptr;
-    RtlZeroMemory(g_slotCache, sizeof(g_slotCache));
-    ResetTlbFull();
+    ResetTlb();
 
     g_chunkCache = (UCHAR*)ExAllocatePool2(POOL_FLAG_NON_PAGED,
                                            CACHED_CHUNKS * 512 * ENTITY_STRIDE, POOL_TAG);
@@ -1308,7 +888,7 @@ extern "C" NTSTATUS DriverEntry(PDRIVER_OBJECT drv, PUNICODE_STRING) {
         return st;
     }
 
-    ULONG curRes = ExSetTimerResolution(10000, TRUE);
+    ULONG curRes = ExSetTimerResolution(10000, TRUE);  // 1 мс (не 0.5)
 
     KeInitializeEvent(&g_workerEvent, NotificationEvent, FALSE);
 
@@ -1321,17 +901,14 @@ extern "C" NTSTATUS DriverEntry(PDRIVER_OBJECT drv, PUNICODE_STRING) {
 
     st = ObReferenceObjectByHandle(h, THREAD_ALL_ACCESS, *PsThreadType, KernelMode,
                                    (PVOID*)&g_workerThread, nullptr);
+    ZwClose(h);
     if (!NT_SUCCESS(st)) {
         InterlockedExchange(&g_stop, 1);
         KeSetEvent(&g_workerEvent, 0, FALSE);
-        ZwWaitForSingleObject(h, FALSE, nullptr);
-        ZwClose(h);
-        DestroyShared();
         return st;
     }
-    ZwClose(h);
 
-    Log("DriverEntry ok (VAD+Ldr, KeStackAttach fallback, res=%u): shared=%p view=%p",
+    Log("DriverEntry ok (MmCopyMemory PHYSICAL + Batch Read, res=%u): shared=%p view=%p",
         curRes, g_sharedVa, g_viewVa);
 
     if (drv) drv->DriverUnload = DriverUnloadFn;
