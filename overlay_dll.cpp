@@ -61,7 +61,6 @@ struct SharedConfig {
     ULONG   ready;
 };
 
-// ВАЖНО: cfg должен быть первым полем — драйвер читает его из начала блока
 struct SharedBlock { SharedConfig cfg; SharedHeader hdr; SharedLog log; SharedEntity ents[MAX_ENTITIES]; };
 #pragma pack(pop)
 
@@ -76,9 +75,9 @@ static std::atomic<bool>         g_run{true};
 static std::atomic<int>          g_W{1920};
 static std::atomic<int>          g_H{1080};
 
-// Рандомные имена, читаются драйвером/нами из конфиг-файла
-static wchar_t g_sharedMapName[128] = {};
-static wchar_t g_viewMapName[128]   = {};
+// ---- ФИКСИРОВАННЫЕ нейтральные имена (совпадают с драйвером) ----
+static const WCHAR* g_sharedMapName = L"\\BaseNamedObjects\\W32Sync_5A3F_s";
+static const WCHAR* g_viewMapName   = L"\\BaseNamedObjects\\W32Sync_5A3F_v";
 static wchar_t g_logPath[MAX_PATH]  = {};
 
 // ===========================================================================
@@ -110,13 +109,12 @@ static std::atomic<uint32_t> g_sharedSnapState{1};
 static uint32_t              g_readIdx = 2;
 
 // ===========================================================================
-// Логирование (SRWLOCK)
+// Логирование
 // ===========================================================================
 static FILE*   g_logFile       = nullptr;
 static SRWLOCK g_logLock       = SRWLOCK_INIT;
 static LONG    g_logFlushCount = 0;
 
-// ---- Рандомные имена: окно, класс, файл лога, конфиг ----
 static wchar_t g_winClass[64] = {};
 static wchar_t g_winTitle[64] = {};
 
@@ -144,70 +142,6 @@ static void GenRandomNames() {
         _snwprintf_s(g_logPath, MAX_PATH, _TRUNCATE, L"%slog_%08lx%08lx.tmp",
                      tmp, (unsigned long)(seed >> 32), (unsigned long)seed);
     }
-}
-
-// Файл конфига: %TEMP%\~cfg.dat — содержит g_sharedMapName\0g_viewMapName\0
-static void WriteConfigFile() {
-    wchar_t tmp[MAX_PATH];
-    if (!GetTempPathW(MAX_PATH, tmp)) return;
-    wchar_t cfg[MAX_PATH];
-    _snwprintf_s(cfg, MAX_PATH, _TRUNCATE, L"%s~cfg.dat", tmp);
-
-    FILE* f = nullptr;
-    _wfopen_s(&f, cfg, L"wb");
-    if (!f) return;
-    fwrite(g_sharedMapName, sizeof(wchar_t), wcslen(g_sharedMapName) + 1, f);
-    fwrite(g_viewMapName,   sizeof(wchar_t), wcslen(g_viewMapName) + 1, f);
-    fclose(f);
-}
-
-// Создаём секции сами (usermode), чтобы задать рандомные имена.
-// Драйвер увидит STATUS_OBJECT_NAME_COLLISION и откроет их.
-static void CreateSharedNamesAndSections() {
-    LARGE_INTEGER t; QueryPerformanceCounter(&t);
-    unsigned long long seed = (unsigned long long)t.QuadPart
-                            ^ GetTickCount64()
-                            ^ ((unsigned long long)GetCurrentProcessId() << 16);
-    if (!seed) seed = 0xD1B54A32D192ED03ULL;
-
-    unsigned long long a = Xs64(seed);
-    unsigned long long b = Xs64(seed);
-
-    _snwprintf_s(g_sharedMapName, 128, _TRUNCATE, L"\\BaseNamedObjects\\%08lx%08lx_s",
-                 (unsigned long)(a >> 32), (unsigned long)a);
-    _snwprintf_s(g_viewMapName, 128, _TRUNCATE, L"\\BaseNamedObjects\\%08lx%08lx_v",
-                 (unsigned long)(b >> 32), (unsigned long)b);
-
-    // Создаём сами секции с рандомными именами. Драйвер откроет их по collision.
-    HANDLE hShared = CreateFileMappingW(INVALID_HANDLE_VALUE, nullptr, PAGE_READWRITE,
-                                        0, sizeof(SharedBlock), g_sharedMapName);
-    if (hShared) {
-        void* p = MapViewOfFile(hShared, FILE_MAP_ALL_ACCESS, 0, 0, sizeof(SharedBlock));
-        if (p) {
-            auto* blk = (SharedBlock*)p;
-            // Заполняем конфиг (offsets + magic). PID и clientBase — позже.
-            blk->cfg.offEntityList      = 0x271A908ULL;
-            blk->cfg.offLocalPlayerPawn = 0x2565718ULL;
-            blk->cfg.offViewMatrix      = 0x256B020ULL;
-            blk->cfg.offGameSceneNode   = 0x330ULL;
-            blk->cfg.offHealth          = 0x34CULL;
-            blk->cfg.offLifeState       = 0x354ULL;
-            blk->cfg.offTeamNum         = 0x3E7ULL;
-            blk->cfg.offModelState      = 0x140ULL;
-            blk->cfg.offPlayerPawn      = 0x92CULL;
-            blk->cfg.magic              = CFG_MAGIC;
-            blk->cfg.ready              = 0;   // PID/base заполним ниже
-            blk->hdr.version            = 1;
-            blk->hdr.maxEntities        = MAX_ENTITIES;
-        }
-        // hShared не закрываем — пусть висит (или можно закрыть, драйвер откроет по имени)
-    }
-
-    HANDLE hView = CreateFileMappingW(INVALID_HANDLE_VALUE, nullptr, PAGE_READWRITE,
-                                      0, 0x1000, g_viewMapName);
-    (void)hView;
-
-    WriteConfigFile();
 }
 
 // Найти PID cs2.exe (usermode)
@@ -245,7 +179,7 @@ static ULONG64 FindClientBase(DWORD pid) {
     return base;
 }
 
-// Заполнить cfg.pid / cfg.clientBase, когда они станут известны
+// Публикует PID/base в cfg, когда они станут известны
 static void PublishPidAndBase() {
     SharedBlock* shm = g_shm.load(std::memory_order_acquire);
     if (!shm) return;
@@ -261,6 +195,62 @@ static void PublishPidAndBase() {
     shm->cfg.clientBase = base;
     shm->cfg.magic      = CFG_MAGIC;
     shm->cfg.ready      = 1;
+}
+
+// Ждём cs2.exe и client.dll до 120 с, потом публикуем
+static DWORD WINAPI WaitForCs2Thread(LPVOID) {
+    for (int i = 0; i < 1200; ++i) {
+        if (!g_run.load(std::memory_order_relaxed)) return 0;
+        SharedBlock* shm = g_shm.load(std::memory_order_acquire);
+        if (!shm) { Sleep(100); continue; }
+        if (shm->cfg.magic != CFG_MAGIC) { Sleep(100); continue; }
+        if (shm->cfg.ready == 1 && shm->cfg.pid != 0 && shm->cfg.clientBase != 0) return 0;
+
+        DWORD pid = FindCs2Pid();
+        if (pid) {
+            ULONG64 base = FindClientBase(pid);
+            if (base) {
+                shm->cfg.pid        = (ULONG)pid;
+                shm->cfg.clientBase = base;
+                shm->cfg.magic      = CFG_MAGIC;
+                shm->cfg.ready      = 1;
+                return 0;
+            }
+        }
+        Sleep(100);
+    }
+    return 0;
+}
+
+// Создаём (или открываем) секции с фиксированными именами и заполняем offsets
+static void CreateSharedNamesAndSections() {
+    HANDLE hShared = CreateFileMappingW(INVALID_HANDLE_VALUE, nullptr, PAGE_READWRITE,
+                                        0, sizeof(SharedBlock), g_sharedMapName);
+    if (hShared) {
+        void* p = MapViewOfFile(hShared, FILE_MAP_ALL_ACCESS, 0, 0, sizeof(SharedBlock));
+        if (p) {
+            auto* blk = (SharedBlock*)p;
+            if (blk->cfg.magic != CFG_MAGIC) {
+                blk->cfg.offEntityList      = 0x271A908ULL;
+                blk->cfg.offLocalPlayerPawn = 0x2565718ULL;
+                blk->cfg.offViewMatrix      = 0x256B020ULL;
+                blk->cfg.offGameSceneNode   = 0x330ULL;
+                blk->cfg.offHealth          = 0x34CULL;
+                blk->cfg.offLifeState       = 0x354ULL;
+                blk->cfg.offTeamNum         = 0x3E7ULL;
+                blk->cfg.offModelState      = 0x140ULL;
+                blk->cfg.offPlayerPawn      = 0x92CULL;
+                blk->cfg.magic              = CFG_MAGIC;
+                blk->cfg.ready              = 0;
+                blk->hdr.version            = 1;
+                blk->hdr.maxEntities        = MAX_ENTITIES;
+            }
+        }
+    }
+
+    HANDLE hView = CreateFileMappingW(INVALID_HANDLE_VALUE, nullptr, PAGE_READWRITE,
+                                      0, 0x1000, g_viewMapName);
+    (void)hView;
 }
 
 static void LogOpen() {
@@ -781,6 +771,7 @@ static DWORD WINAPI InitThread(LPVOID) {
         }
     }
 
+    CreateThread(nullptr, 0, WaitForCs2Thread, nullptr, 0, nullptr);
     CreateThread(nullptr, 0, DiagThread, nullptr, 0, nullptr);
     CreateThread(nullptr, 0, AsyncDataWorkerThread, nullptr, 0, nullptr);
 
