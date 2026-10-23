@@ -6,6 +6,7 @@
 #include <ntddk.h>
 #include <intrin.h>
 #include <stdarg.h>
+#include <ntstrsafe.h>
 
 extern "C" NTSTATUS ZwQuerySystemInformation(
     ULONG SystemInformationClass,
