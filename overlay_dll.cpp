@@ -17,6 +17,7 @@
 #include <d3d11.h>
 #include <dxgi1_3.h>
 #include <dwmapi.h>
+#include <tlhelp32.h>
 #include <atomic>
 #include <array>
 #include <cmath>
@@ -42,8 +43,29 @@ struct SharedEntity { int valid; int hp; int team; int pad0; SharedBone bones[MA
 struct SharedHeader { volatile LONG seq; ULONG maxEntities; ULONG entityCount; ULONG version; };
 struct SharedLogEntry { ULONG tick; char text[LOG_LINE_MAX]; };
 struct SharedLog { volatile LONG head; volatile LONG tail; SharedLogEntry entries[MAX_LOGS]; };
-struct SharedBlock { SharedHeader hdr; SharedLog log; SharedEntity ents[MAX_ENTITIES]; };
+
+struct SharedConfig {
+    ULONG64 offEntityList;
+    ULONG64 offLocalPlayerPawn;
+    ULONG64 offViewMatrix;
+    ULONG64 offGameSceneNode;
+    ULONG64 offHealth;
+    ULONG64 offLifeState;
+    ULONG64 offTeamNum;
+    ULONG64 offModelState;
+    ULONG64 offPlayerPawn;
+    ULONG   pid;
+    ULONG   pad0;
+    ULONG64 clientBase;
+    ULONG   magic;    // 0x45535043 = 'ESPC'
+    ULONG   ready;
+};
+
+// ВАЖНО: cfg должен быть первым полем — драйвер читает его из начала блока
+struct SharedBlock { SharedConfig cfg; SharedHeader hdr; SharedLog log; SharedEntity ents[MAX_ENTITIES]; };
 #pragma pack(pop)
+
+constexpr ULONG CFG_MAGIC = 0x45535043; // 'ESPC'
 
 static std::atomic<SharedBlock*> g_shm{nullptr};
 static std::atomic<float*>       g_view{nullptr};
@@ -54,8 +76,13 @@ static std::atomic<bool>         g_run{true};
 static std::atomic<int>          g_W{1920};
 static std::atomic<int>          g_H{1080};
 
+// Рандомные имена, читаются драйвером/нами из конфиг-файла
+static wchar_t g_sharedMapName[128] = {};
+static wchar_t g_viewMapName[128]   = {};
+static wchar_t g_logPath[MAX_PATH]  = {};
+
 // ===========================================================================
-// Асинхронный Тройной Буфер (Lock-Free Triple Buffering) между Worker и Render
+// Тройной буфер
 // ===========================================================================
 constexpr size_t BONE_CONNS_COUNT = 17;
 static constexpr std::array<std::pair<uint8_t, uint8_t>, BONE_CONNS_COUNT> CONN = {{
@@ -79,28 +106,168 @@ struct RenderSnapshot {
 };
 
 static RenderSnapshot        g_snapshots[3];
-// Младшие 2 бита — индекс центрального буфера (0, 1 или 2).
-// Бит 0x80 — флаг наличия нового кадра от Worker'а.
-// Изначально: 0 — у Worker'а (writeIdx), 1 — в центре (g_sharedSnapState), 2 — у Render'а (g_readIdx).
 static std::atomic<uint32_t> g_sharedSnapState{1};
 static uint32_t              g_readIdx = 2;
 
 // ===========================================================================
-// Потокобезопасное логирование (SRWLOCK — быстрее CRITICAL_SECTION в C++20)
+// Логирование (SRWLOCK)
 // ===========================================================================
 static FILE*   g_logFile       = nullptr;
 static SRWLOCK g_logLock       = SRWLOCK_INIT;
 static LONG    g_logFlushCount = 0;
 
-static void LogOpen() {
+// ---- Рандомные имена: окно, класс, файл лога, конфиг ----
+static wchar_t g_winClass[64] = {};
+static wchar_t g_winTitle[64] = {};
+
+static __forceinline unsigned long long Xs64(unsigned long long& s) {
+    s ^= s << 13; s ^= s >> 7; s ^= s << 17; return s;
+}
+
+static void GenRandomNames() {
+    LARGE_INTEGER t; QueryPerformanceCounter(&t);
+    unsigned long long seed = (unsigned long long)t.QuadPart
+                            ^ GetTickCount64()
+                            ^ ((unsigned long long)GetCurrentProcessId() << 32);
+    if (!seed) seed = 0x9E3779B97F4A7C15ULL;
+
+    unsigned long long a = Xs64(seed);
+    unsigned long long b = Xs64(seed);
+
+    _snwprintf_s(g_winClass, 64, _TRUNCATE, L"Cls_%08lx%08lx",
+                 (unsigned long)(a >> 32), (unsigned long)a);
+    _snwprintf_s(g_winTitle, 64, _TRUNCATE, L"Wnd_%08lx%08lx",
+                 (unsigned long)(b >> 16), (unsigned long)(b >> 48));
+
+    wchar_t tmp[MAX_PATH];
+    if (GetTempPathW(MAX_PATH, tmp)) {
+        _snwprintf_s(g_logPath, MAX_PATH, _TRUNCATE, L"%slog_%08lx%08lx.tmp",
+                     tmp, (unsigned long)(seed >> 32), (unsigned long)seed);
+    }
+}
+
+// Файл конфига: %TEMP%\~cfg.dat — содержит g_sharedMapName\0g_viewMapName\0
+static void WriteConfigFile() {
     wchar_t tmp[MAX_PATH];
     if (!GetTempPathW(MAX_PATH, tmp)) return;
+    wchar_t cfg[MAX_PATH];
+    _snwprintf_s(cfg, MAX_PATH, _TRUNCATE, L"%s~cfg.dat", tmp);
 
-    wchar_t pathW[MAX_PATH];
-    _snwprintf_s(pathW, MAX_PATH, _TRUNCATE, L"%scs2esp_overlay.log", tmp);
+    FILE* f = nullptr;
+    _wfopen_s(&f, cfg, L"wb");
+    if (!f) return;
+    fwrite(g_sharedMapName, sizeof(wchar_t), wcslen(g_sharedMapName) + 1, f);
+    fwrite(g_viewMapName,   sizeof(wchar_t), wcslen(g_viewMapName) + 1, f);
+    fclose(f);
+}
 
+// Создаём секции сами (usermode), чтобы задать рандомные имена.
+// Драйвер увидит STATUS_OBJECT_NAME_COLLISION и откроет их.
+static void CreateSharedNamesAndSections() {
+    LARGE_INTEGER t; QueryPerformanceCounter(&t);
+    unsigned long long seed = (unsigned long long)t.QuadPart
+                            ^ GetTickCount64()
+                            ^ ((unsigned long long)GetCurrentProcessId() << 16);
+    if (!seed) seed = 0xD1B54A32D192ED03ULL;
+
+    unsigned long long a = Xs64(seed);
+    unsigned long long b = Xs64(seed);
+
+    _snwprintf_s(g_sharedMapName, 128, _TRUNCATE, L"\\BaseNamedObjects\\%08lx%08lx_s",
+                 (unsigned long)(a >> 32), (unsigned long)a);
+    _snwprintf_s(g_viewMapName, 128, _TRUNCATE, L"\\BaseNamedObjects\\%08lx%08lx_v",
+                 (unsigned long)(b >> 32), (unsigned long)b);
+
+    // Создаём сами секции с рандомными именами. Драйвер откроет их по collision.
+    HANDLE hShared = CreateFileMappingW(INVALID_HANDLE_VALUE, nullptr, PAGE_READWRITE,
+                                        0, sizeof(SharedBlock), g_sharedMapName);
+    if (hShared) {
+        void* p = MapViewOfFile(hShared, FILE_MAP_ALL_ACCESS, 0, 0, sizeof(SharedBlock));
+        if (p) {
+            auto* blk = (SharedBlock*)p;
+            // Заполняем конфиг (offsets + magic). PID и clientBase — позже.
+            blk->cfg.offEntityList      = 0x271A908ULL;
+            blk->cfg.offLocalPlayerPawn = 0x2565718ULL;
+            blk->cfg.offViewMatrix      = 0x256B020ULL;
+            blk->cfg.offGameSceneNode   = 0x330ULL;
+            blk->cfg.offHealth          = 0x34CULL;
+            blk->cfg.offLifeState       = 0x354ULL;
+            blk->cfg.offTeamNum         = 0x3E7ULL;
+            blk->cfg.offModelState      = 0x140ULL;
+            blk->cfg.offPlayerPawn      = 0x92CULL;
+            blk->cfg.magic              = CFG_MAGIC;
+            blk->cfg.ready              = 0;   // PID/base заполним ниже
+            blk->hdr.version            = 1;
+            blk->hdr.maxEntities        = MAX_ENTITIES;
+        }
+        // hShared не закрываем — пусть висит (или можно закрыть, драйвер откроет по имени)
+    }
+
+    HANDLE hView = CreateFileMappingW(INVALID_HANDLE_VALUE, nullptr, PAGE_READWRITE,
+                                      0, 0x1000, g_viewMapName);
+    (void)hView;
+
+    WriteConfigFile();
+}
+
+// Найти PID cs2.exe (usermode)
+static DWORD FindCs2Pid() {
+    HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+    if (snap == INVALID_HANDLE_VALUE) return 0;
+    PROCESSENTRY32W pe{};
+    pe.dwSize = sizeof(pe);
+    DWORD pid = 0;
+    if (Process32FirstW(snap, &pe)) {
+        do {
+            if (_wcsicmp(pe.szExeFile, L"cs2.exe") == 0) { pid = pe.th32ProcessID; break; }
+        } while (Process32NextW(snap, &pe));
+    }
+    CloseHandle(snap);
+    return pid;
+}
+
+// Найти базу client.dll в процессе (usermode)
+static ULONG64 FindClientBase(DWORD pid) {
+    HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPMODULE | TH32CS_SNAPMODULE32, pid);
+    if (snap == INVALID_HANDLE_VALUE) return 0;
+    MODULEENTRY32W me{};
+    me.dwSize = sizeof(me);
+    ULONG64 base = 0;
+    if (Module32FirstW(snap, &me)) {
+        do {
+            if (_wcsicmp(me.szModule, L"client.dll") == 0) {
+                base = (ULONG64)me.modBaseAddr;
+                break;
+            }
+        } while (Module32NextW(snap, &me));
+    }
+    CloseHandle(snap);
+    return base;
+}
+
+// Заполнить cfg.pid / cfg.clientBase, когда они станут известны
+static void PublishPidAndBase() {
+    SharedBlock* shm = g_shm.load(std::memory_order_acquire);
+    if (!shm) return;
+    if (shm->cfg.magic != CFG_MAGIC) return;
+    if (shm->cfg.ready == 1 && shm->cfg.pid != 0 && shm->cfg.clientBase != 0) return;
+
+    DWORD pid = FindCs2Pid();
+    if (!pid) return;
+    ULONG64 base = FindClientBase(pid);
+    if (!base) return;
+
+    shm->cfg.pid        = (ULONG)pid;
+    shm->cfg.clientBase = base;
+    shm->cfg.magic      = CFG_MAGIC;
+    shm->cfg.ready      = 1;
+}
+
+static void LogOpen() {
+    if (!g_logPath[0]) GenRandomNames();
+    if (!g_logPath[0]) return;
     char pathA[MAX_PATH * 2];
-    if (!WideCharToMultiByte(CP_UTF8, 0, pathW, -1, pathA, sizeof(pathA), nullptr, nullptr)) return;
+    if (!WideCharToMultiByte(CP_UTF8, 0, g_logPath, -1, pathA, sizeof(pathA), nullptr, nullptr)) return;
     fopen_s(&g_logFile, pathA, "a");
 }
 
@@ -134,7 +301,7 @@ static void LogSelf(const char* fmt, ...) {
 static void LogKernelLine(const SharedLogEntry& le) {
     if (!le.text[0]) return;
     char line[640];
-    _snprintf_s(line, sizeof(line), _TRUNCATE, "[kernel #%u] %s\n", le.tick, le.text);
+    _snprintf_s(line, sizeof(line), _TRUNCATE, "[k #%u] %s\n", le.tick, le.text);
     OutputDebugStringA(line);
 
     AcquireSRWLockExclusive(&g_logLock);
@@ -167,7 +334,7 @@ static void DrainKernelLogs() {
 }
 
 // ===========================================================================
-// Proxy version.dll экспорты
+// Proxy version.dll
 // ===========================================================================
 typedef WINBOOL (WINAPI* fnGVIA)(LPCSTR,DWORD,DWORD,LPVOID);
 typedef WINBOOL (WINAPI* fnGVIW)(LPCWSTR,DWORD,DWORD,LPVOID);
@@ -205,7 +372,7 @@ static void LoadReal() {
 }
 
 // ===========================================================================
-// Быстрая математика и асинхронный поток предобработки (Async Worker Thread)
+// Математика и Async Worker
 // ===========================================================================
 static __forceinline bool FastW2S(const float* __restrict m, float x, float y, float z,
                                   float cx, float cy, float& sx, float& sy) noexcept {
@@ -330,7 +497,7 @@ static DWORD WINAPI AsyncDataWorkerThread(LPVOID) {
 }
 
 // ===========================================================================
-// DirectX 11 + VSync Waitable SwapChain
+// D3D11
 // ===========================================================================
 static HWND                    g_hWnd            = nullptr;
 static ID3D11Device*           g_dev             = nullptr;
@@ -372,7 +539,7 @@ static bool CreateDev(HWND h) {
         nullptr, D3D_DRIVER_TYPE_HARDWARE, nullptr, D3D11_CREATE_DEVICE_SINGLETHREADED,
         fls, 2, D3D11_SDK_VERSION, &sd, &g_sc, &g_dev, &fl, &g_ctx);
     if (FAILED(hr)) {
-        LogSelf("D3D11CreateDeviceAndSwapChain failed hr=0x%08lX", (unsigned long)hr);
+        LogSelf("d3d fail hr=0x%08lX", (unsigned long)hr);
         return false;
     }
 
@@ -417,7 +584,6 @@ static void DrawKernelLogs(ImDrawList* d) {
 }
 
 static void Render(ImDrawList* d) {
-    // Забираем новый буфер из центра только если бит 0x80 выставлен Worker'ом
     uint32_t state = g_sharedSnapState.load(std::memory_order_acquire);
     if (state & 0x80u) {
         uint32_t prev = g_sharedSnapState.exchange(g_readIdx, std::memory_order_acq_rel);
@@ -427,7 +593,7 @@ static void Render(ImDrawList* d) {
 
     char statusLine[256];
     _snprintf_s(statusLine, sizeof(statusLine), _TRUNCATE,
-        "shm=%s view=%s | seq=%ld entities=%u ver=%lu | W=%d H=%d [VSync ON]",
+        "shm=%s view=%s | seq=%ld entities=%u ver=%lu | W=%d H=%d",
         g_shm.load(std::memory_order_relaxed) ? "OK" : "NULL",
         g_view.load(std::memory_order_relaxed) ? "OK" : "NULL",
         snap.seq, snap.count, snap.ver,
@@ -458,32 +624,34 @@ static DWORD WINAPI DiagThread(LPVOID) {
     unsigned diagCounter = 0;
     while (g_run.load(std::memory_order_relaxed)) {
         if (!g_shm.load(std::memory_order_acquire)) {
-            HANDLE m = OpenFileMappingW(FILE_MAP_READ, FALSE, L"Global\\Cs2EspShared_v1");
+            HANDLE m = OpenFileMappingW(FILE_MAP_ALL_ACCESS, FALSE, g_sharedMapName);
             if (m) {
-                auto* ptr = (SharedBlock*)MapViewOfFile(m, FILE_MAP_READ, 0, 0, sizeof(SharedBlock));
+                auto* ptr = (SharedBlock*)MapViewOfFile(m, FILE_MAP_ALL_ACCESS, 0, 0, sizeof(SharedBlock));
                 if (ptr) {
                     g_map = m;
                     g_shm.store(ptr, std::memory_order_release);
-                    LogSelf("DiagThread: OpenFileMapping(Shared) ok shm=%p", ptr);
+                    LogSelf("diag: shm ok %p", ptr);
+                    PublishPidAndBase();
                 } else {
                     CloseHandle(m);
                 }
             }
         }
         if (!g_view.load(std::memory_order_acquire)) {
-            HANDLE m = OpenFileMappingW(FILE_MAP_READ, FALSE, L"Global\\Cs2EspView_v1");
+            HANDLE m = OpenFileMappingW(FILE_MAP_ALL_ACCESS, FALSE, g_viewMapName);
             if (m) {
-                auto* ptr = (float*)MapViewOfFile(m, FILE_MAP_READ, 0, 0, 0x1000);
+                auto* ptr = (float*)MapViewOfFile(m, FILE_MAP_ALL_ACCESS, 0, 0, 0x1000);
                 if (ptr) {
                     g_viewMap = m;
                     g_view.store(ptr, std::memory_order_release);
-                    LogSelf("DiagThread: OpenFileMapping(View) ok view=%p", ptr);
+                    LogSelf("diag: view ok %p", ptr);
                 } else {
                     CloseHandle(m);
                 }
             }
         }
 
+        PublishPidAndBase();
         DrainKernelLogs();
 
         if (++diagCounter >= 5) {
@@ -509,12 +677,12 @@ static DWORD WINAPI OverlayThread(LPVOID) {
 
     WNDCLASSEXW wc = { sizeof(wc), CS_CLASSDC, WndProc, 0, 0, GetModuleHandleW(nullptr),
                        LoadIcon(nullptr, IDI_APPLICATION), LoadCursor(nullptr, IDC_ARROW),
-                       nullptr, nullptr, L"DiscordOvClass", nullptr };
+                       nullptr, nullptr, g_winClass, nullptr };
     RegisterClassExW(&wc);
 
     g_hWnd = CreateWindowExW(
         WS_EX_TOPMOST | WS_EX_TRANSPARENT | WS_EX_LAYERED | WS_EX_APPWINDOW | WS_EX_NOACTIVATE,
-        wc.lpszClassName, L"Discord Overlay", WS_POPUP, 0, 0, w, h,
+        wc.lpszClassName, g_winTitle, WS_POPUP, 0, 0, w, h,
         nullptr, nullptr, wc.hInstance, nullptr);
     if (!g_hWnd) return 0;
 
@@ -585,23 +753,26 @@ static DWORD WINAPI OverlayThread(LPVOID) {
 }
 
 static DWORD WINAPI InitThread(LPVOID) {
+    GenRandomNames();
+    CreateSharedNamesAndSections();
     LogOpen();
     LoadReal();
 
-    HANDLE mShared = OpenFileMappingW(FILE_MAP_READ, FALSE, L"Global\\Cs2EspShared_v1");
+    HANDLE mShared = OpenFileMappingW(FILE_MAP_ALL_ACCESS, FALSE, g_sharedMapName);
     if (mShared) {
-        auto* ptr = (SharedBlock*)MapViewOfFile(mShared, FILE_MAP_READ, 0, 0, sizeof(SharedBlock));
+        auto* ptr = (SharedBlock*)MapViewOfFile(mShared, FILE_MAP_ALL_ACCESS, 0, 0, sizeof(SharedBlock));
         if (ptr) {
             g_map = mShared;
             g_shm.store(ptr, std::memory_order_release);
+            PublishPidAndBase();
         } else {
             CloseHandle(mShared);
         }
     }
 
-    HANDLE mView = OpenFileMappingW(FILE_MAP_READ, FALSE, L"Global\\Cs2EspView_v1");
+    HANDLE mView = OpenFileMappingW(FILE_MAP_ALL_ACCESS, FALSE, g_viewMapName);
     if (mView) {
-        auto* ptr = (float*)MapViewOfFile(mView, FILE_MAP_READ, 0, 0, 0x1000);
+        auto* ptr = (float*)MapViewOfFile(mView, FILE_MAP_ALL_ACCESS, 0, 0, 0x1000);
         if (ptr) {
             g_viewMap = mView;
             g_view.store(ptr, std::memory_order_release);
