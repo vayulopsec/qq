@@ -6,7 +6,6 @@
 #include <ntddk.h>
 #include <intrin.h>
 #include <stdarg.h>
-#include <ntstrsafe.h>
 
 extern "C" NTSTATUS ZwQuerySystemInformation(
     ULONG SystemInformationClass,
@@ -35,7 +34,7 @@ extern "C" NTSTATUS ZwQuerySection(
 );
 
 // ---- Pool tag: рандомный, генерируется в DriverEntry ----
-static ULONG g_poolTag = 'Ntfs';   // fallback, если генерация не удалась
+static ULONG g_poolTag = 'Ntfs';   // fallback
 
 constexpr ULONG   MAX_ENTITIES   = 64;
 constexpr ULONG   MAX_BONES      = 24;
@@ -43,7 +42,7 @@ constexpr ULONG   MAX_LOGS       = 256;
 constexpr ULONG   LOG_LINE_MAX   = 128;
 constexpr ULONG   ENTITY_STRIDE  = 112; // 0x70
 
-// ---- Offsets: больше НЕ константы. Заполняются из usermode через SharedConfig ----
+// ---- Offsets: заполняются из usermode через SharedConfig ----
 static ULONG64 g_offEntityList      = 0;
 static ULONG64 g_offLocalPlayerPawn = 0;
 static ULONG64 g_offViewMatrix      = 0;
@@ -57,7 +56,6 @@ static ULONG64 g_offPlayerPawn      = 0;
 static ULONG64 g_pawnBatchBase      = 0;
 static SIZE_T  g_pawnBatchSize      = 0;
 
-// ---- Значения PID/base, переданные из usermode ----
 static ULONG   g_cfgPid        = 0;
 static ULONG64 g_cfgClientBase = 0;
 
@@ -67,7 +65,6 @@ constexpr ULONG64 PHYS_MASK_1G          = 0x000FFFFFC0000000ULL;
 
 #pragma pack(push, 1)
 
-// Конфиг из usermode: offsets + PID + clientBase + magic
 struct SHARED_CONFIG {
     ULONG64 offEntityList;
     ULONG64 offLocalPlayerPawn;
@@ -86,7 +83,7 @@ struct SHARED_CONFIG {
 };
 
 struct SHARED_BONE {
-    ULONG xBits, yBits, zBits; // Храним как сырые 32-битные поля (float на стороне usermode)
+    ULONG xBits, yBits, zBits;
 };
 
 struct SHARED_ENTITY {
@@ -116,7 +113,7 @@ struct SHARED_LOG {
 };
 
 struct SHARED_BLOCK {
-    SHARED_CONFIG cfg;   // <-- ДОЛЖЕН быть первым полем, usermode пишет сюда
+    SHARED_CONFIG cfg;   // первое поле — usermode пишет сюда
     SHARED_HEADER hdr;
     SHARED_LOG    log;
     SHARED_ENTITY ents[256];
@@ -130,9 +127,9 @@ static HANDLE        g_hViewSection   = nullptr;
 static PVOID         g_viewSecObj     = nullptr;
 static ULONG*        g_viewVa         = nullptr;
 
-// ---- Рандомные имена секций (генерируются в DriverEntry) ----
-static WCHAR         g_sharedName[80];
-static WCHAR         g_viewName[80];
+// ---- ФИКСИРОВАННЫЕ нейтральные имена (порядок загрузки не важен) ----
+static const WCHAR* g_sharedName = L"\\BaseNamedObjects\\W32Sync_5A3F_s";
+static const WCHAR* g_viewName   = L"\\BaseNamedObjects\\W32Sync_5A3F_v";
 
 static ULONG64       g_cs2Cr3         = 0;
 static ULONG64       g_clientBase     = 0;
@@ -149,7 +146,7 @@ static volatile LONG g_statReadFails  = 0;
 
 static bool          g_offsetsReady   = false;
 
-// ---- Локальный кэш трансляции адресов (TLB 256 + PML4) на один тик ----
+// ---- TLB ----
 constexpr ULONG TLB_SIZE = 256;
 
 struct TlbEntry {
@@ -178,39 +175,29 @@ static __forceinline void ResetTlb() {
 }
 
 // ---------------------------------------------------------------------------
-// Генерация рандомных имён и pool tag
+// Генерация рандомного pool tag
 // ---------------------------------------------------------------------------
 static __forceinline ULONG64 XorShift64(ULONG64& s) {
     s ^= s << 13; s ^= s >> 7; s ^= s << 17;
     return s;
 }
 
-static void GenRandomNamesAndTag() {
+static void GenPoolTag() {
     LARGE_INTEGER t; KeQueryTickCount(&t);
     ULONG64 seed = (ULONG64)t.QuadPart ^ __rdtsc();
     if (seed == 0) seed = 0x9E3779B97F4A7C15ULL;
 
-    ULONG64 a = XorShift64(seed);
-    ULONG64 b = XorShift64(seed);
-
-    // Pool tag: 4 произвольных ASCII-печатных символа
     ULONG tag = 0;
     for (int i = 0; i < 4; ++i) {
-        UCHAR c = (UCHAR)(0x20 + (XorShift64(seed) % 0x5F)); // 0x20..0x7E
+        UCHAR c = (UCHAR)(0x20 + (XorShift64(seed) % 0x5F));
         tag |= ((ULONG)c) << (8 * i);
     }
     if (tag == 0) tag = 'Ntfs';
     g_poolTag = tag;
-
-    // Имена секций: \BaseNamedObjects\<16hex>_s / _v
-    RtlStringCbPrintfW(g_sharedName, sizeof(g_sharedName),
-        L"\\BaseNamedObjects\\%08lx%08lx_s", (ULONG)(a >> 32), (ULONG)a);
-    RtlStringCbPrintfW(g_viewName, sizeof(g_viewName),
-        L"\\BaseNamedObjects\\%08lx%08lx_v", (ULONG)(b >> 32), (ULONG)b);
 }
 
 // ---------------------------------------------------------------------------
-// Мини-форматтер для kernel-mode
+// Мини-форматтер для kernel-mode: без UCRT, без FP
 // ---------------------------------------------------------------------------
 static char* KAppendChar(char* p, char* end, char c) {
     if (p < end) *p++ = c;
@@ -404,7 +391,7 @@ static __forceinline BOOLEAN RdD(ULONG64 va, PULONG   out) { return ReadCs2Memor
 
 static __forceinline ULONG64 GetProcessCr3(PEPROCESS p) {
     ULONG64 cr3 = *(ULONG64*)((PUCHAR)p + 0x28);
-    return cr3 & PHYS_MASK_4K;   // срезаем PCID/флаги
+    return cr3 & PHYS_MASK_4K;
 }
 
 static __forceinline BOOLEAN IsCr3Sane(ULONG64 cr3) {
@@ -424,7 +411,7 @@ static void ClearShared() {
 }
 
 static void ResetProcessState(const char* reason) {
-    Log("process state reset: %s", reason);
+    Log("reset: %s", reason);
     g_cs2Cr3      = 0;
     g_cs2Pid      = nullptr;
     g_clientBase  = 0;
@@ -439,7 +426,7 @@ static BOOLEAN VerifyCr3EachTick() {
 
     PEPROCESS p = nullptr;
     if (!NT_SUCCESS(PsLookupProcessByProcessId(g_cs2Pid, &p)) || !p) {
-        ResetProcessState("process gone");
+        ResetProcessState("proc gone");
         return FALSE;
     }
 
@@ -481,7 +468,6 @@ static __forceinline ULONG64 FastEntityByIndex(const ULONG64* chunkPtrs,
     return *(const ULONG64*)entryPtr;
 }
 
-// ---- Чтение конфига из usermode (offsets + pid + base) ----
 static void TryLoadConfig() {
     if (g_offsetsReady || !g_sharedVa) return;
     const SHARED_CONFIG* c = &g_sharedVa->cfg;
@@ -507,7 +493,7 @@ static void TryLoadConfig() {
         g_pawnBatchSize = 0xB8;
     }
     g_offsetsReady = true;
-    Log("config loaded");
+    Log("cfg loaded");
 }
 
 static void Tick() {
@@ -520,7 +506,6 @@ static void Tick() {
     ULONG tick = ++s_tickCount;
     bool logNow = ((tick % 500) == 0);
 
-    // 0) Конфиг из usermode
     if (!g_offsetsReady) {
         TryLoadConfig();
         if (!g_offsetsReady) {
@@ -529,17 +514,12 @@ static void Tick() {
         }
     }
 
-    // 1) Сверка CR3
     if (g_cs2Pid) {
         if (!VerifyCr3EachTick()) return;
     }
 
-    // 2) Поиск процесса через PID из usermode
     if (!g_cs2Cr3) {
-        if (!g_cfgPid) {
-            ClearShared();
-            return;
-        }
+        if (!g_cfgPid) { ClearShared(); return; }
         PEPROCESS p = nullptr;
         if (!NT_SUCCESS(PsLookupProcessByProcessId((HANDLE)(ULONG_PTR)g_cfgPid, &p)) || !p) {
             ClearShared();
@@ -564,16 +544,11 @@ static void Tick() {
         }
     }
 
-    // 3) clientBase из usermode
     if (!g_clientBase) {
-        if (!g_cfgClientBase) {
-            ClearShared();
-            return;
-        }
+        if (!g_cfgClientBase) { ClearShared(); return; }
         g_clientBase = g_cfgClientBase;
     }
 
-    // 4) Чтение данных игры
     ULONG64 lp = 0, es = 0;
     BOOLEAN gotLp = RdQ(g_clientBase + g_offLocalPlayerPawn, &lp);
     BOOLEAN gotEs = RdQ(g_clientBase + g_offEntityList, &es);
@@ -866,7 +841,7 @@ extern "C" NTSTATUS DriverEntry(PDRIVER_OBJECT drv, PUNICODE_STRING) {
     g_cfgClientBase = 0;
     ResetTlb();
 
-    GenRandomNamesAndTag();
+    GenPoolTag();
 
     g_chunkCache = (UCHAR*)ExAllocatePool2(POOL_FLAG_NON_PAGED,
                                            CACHED_CHUNKS * 512 * ENTITY_STRIDE, g_poolTag);
